@@ -892,6 +892,23 @@ def capture_snapshots(client: httpx.Client) -> list[dict]:
         "trace_events": [], "volatile": True,
         "notes": "Names/keys only; values vary per capture",
     })
+    # Stage 7: the OpenAI-compatible discovery surface the Hermes agent
+    # (and the model-provider plugin) consumes. Fully deterministic:
+    # sorted deduplicated ids, FIXED_EPOCH created, static config.
+    r = client.get(f"{ROUTER_URL}/v1/models",
+                   headers={"Authorization": AUTH_HEADER})
+    snaps.append({
+        "name": "golden_96_models",
+        "description": "GET /v1/models — OpenAI-compatible model listing "
+                       "(admin key); Stage 7 ingress plane",
+        "request": {"method": "GET", "path": "/v1/models",
+                    "headers": {"Authorization": "Bearer [set]"}, "body": None},
+        "response": {"status": r.status_code, "body": r.json()},
+        "trace_events": [], "volatile": False,
+        "notes": "Sorted, deduplicated model ids across categories with "
+                 "hermes_router tier metadata; created pinned by the "
+                 "fixed epoch",
+    })
     return snaps
 
 
@@ -964,6 +981,10 @@ def main() -> None:
                 "active); snapshot 95 pins the dashboard structure contract "
                 "(section ids, zero-asset rule); /metrics gains the alerts_* "
                 "counter family while the alerts section is enabled",
+                "Stage 7: snapshot 96 pins the /v1/models ingress surface "
+                "(OpenAI list shape, deduplicated ids, hermes_router tier "
+                "metadata) consumed by the Hermes agent and the "
+                "model-provider plugin",
                 "Re-capture at every stage boundary; diff = behavior regression signal",
             ],
             "fixtures": [f["name"] for f in fixtures],

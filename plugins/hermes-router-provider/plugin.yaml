@@ -1,0 +1,21 @@
+# Hermes model-provider plugin: hermes-router gateway (Stage 7).
+#
+# Pinned contract (dossier Ch. 3.2 — verified against the agent's public
+# plugin documentation; drift policy in docs/HERMES_INTEGRATION.md):
+#   * location   ~/.hermes/plugins/hermes-router-provider/            (this dir)
+#   * manifest   plugin.yaml, kind: model-provider
+#   * entrypoint register(ctx) in provider.py (module:function form below)
+#   * registry   ctx.register_provider(...) — the agent's public
+#                provider-registry API (register() adapts to the observed
+#                call shapes defensively; upstream drift must not break boot)
+#   * gateway    OpenAI-compatible surface: POST /v1/chat/completions and
+#                GET /v1/models with bearer auth (hermes-router Stage 7)
+name: hermes-router-provider
+version: 1.0.0
+kind: model-provider
+description: >
+  Routes the Hermes agent through a self-hosted hermes-router gateway:
+  content-based tier routing, free-tier key pooling, virtual-key budgets
+  and the immutable cost ledger — with native model discovery over the
+  gateway's GET /v1/models endpoint.
+entrypoint: provider:register

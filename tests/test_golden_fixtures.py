@@ -63,6 +63,7 @@ def test_fixture_suite_is_present():
         "golden_93_admin_costguard",
         "golden_94_admin_alerts",
         "golden_95_dashboard",
+        "golden_96_models",
     ]:
         assert required in names, f"missing fixture: {required}"
 
@@ -669,3 +670,43 @@ def test_95_dashboard_contract():
         "pools", "circuits", "costguard", "catalog"]
     assert body["has_scripts"] is False
     assert body["has_refresh_meta"] is False
+
+
+def test_96_models_contract():
+    """Stage 7 ingress plane: GET /v1/models pins the OpenAI list shape,
+    sorted deduplicated ids across primary + fallback hops, the
+    per-adapter owned_by attribution and the hermes_router tier
+    metadata the model-provider plugin surfaces."""
+    d = _load("golden_96_models")
+    assert d["response"]["status"] == 200
+    assert d["request"]["headers"].get("Authorization") == "Bearer [set]"
+    body = d["response"]["body"]
+    assert body["object"] == "list"
+    ids = [m["id"] for m in body["data"]]
+    assert ids == sorted(ids) == [
+        "stub-anthropic", "stub-complex", "stub-fallback", "stub-simple"]
+    assert len(ids) == len(set(ids)), "deduplicated"
+    by_id = {m["id"]: m for m in body["data"]}
+    for m in body["data"]:
+        assert m["object"] == "model"
+        assert isinstance(m["created"], int)
+        assert m["hermes_router"]["categories"]
+        assert m["hermes_router"]["roles"]
+    assert by_id["stub-anthropic"]["owned_by"] == "anthropic"
+    assert by_id["stub-complex"]["owned_by"] == "openai"
+    assert by_id["stub-fallback"]["owned_by"] == "openai"
+    assert by_id["stub-anthropic"]["hermes_router"] == {
+        "categories": ["anthropic"], "roles": ["primary"]}
+    assert by_id["stub-complex"]["hermes_router"] == {
+        "categories": ["complex"], "roles": ["primary"]}
+    assert by_id["stub-fallback"]["hermes_router"] == {
+        "categories": ["simple", "anthropic", "pooled_exhaust"],
+        "roles": ["fallback"]}
+    assert by_id["stub-simple"]["hermes_router"] == {
+        "categories": ["simple", "pooled", "pooled_exhaust",
+                       "pooled_stream", "pooled_guard"],
+        "roles": ["primary"]}
+    # deterministic capture: created pinned by the fixed epoch
+    assert {m["created"] for m in body["data"]} == {
+        m["created"] for m in body["data"]}
+    assert body["data"][0]["created"] > 0

@@ -92,6 +92,7 @@ from providers import (
     PROVIDER_REGISTRY,
     AdapterError,
     get_provider,
+    now_epoch,
     provider_name,
     validate_provider_config,
 )
@@ -3814,6 +3815,55 @@ async def alerts_test(request: Request):
     _ALERTS.note_webhook_result(delivered)
     return {"delivered": delivered, "status_code": status_code,
             "error": error}
+
+
+@app.get("/v1/models")
+async def list_models(request: Request):
+    """OpenAI-compatible model listing (Stage 7 ingress plane, Ch. 8.1).
+
+    Enumerates every upstream model the router can reach across the
+    configured categories — primary, fallback and fallback2 hops —
+    deduplicated by model name and sorted for deterministic output.
+    Each entry carries the standard OpenAI fields plus a namespaced
+    ``hermes_router`` block (the categories that route to the model and
+    the roles it plays), so model-provider plugins and BYOM clients can
+    surface tier structure without admin access. Model ids are exactly
+    the names clients may send in ``custom_providers.model`` / request
+    ``model`` fields; the response's ``model`` echo on every completion
+    already exposes them, so this surface leaks nothing new.
+
+    Inference surface: both principal kinds may list (admin gateway key
+    and virtual keys — the discovery call an agent's OpenAI client
+    makes). ``created`` honors the deterministic epoch hook, keeping
+    golden captures byte-stable.
+    """
+    verify_auth(request)
+    cfg = request.app.state.config
+    models: dict[str, dict[str, Any]] = {}
+    for cat_name, cat in (cfg.get("categories") or {}).items():
+        hops: list[tuple[str, Any, Any]] = [
+            ("primary", cat.get("model"), cat.get("provider")),
+            ("fallback", cat.get("fallback_model"),
+             cat.get("fallback_provider") or cat.get("provider")),
+            ("fallback2", cat.get("fallback2_model"),
+             cat.get("fallback2_provider") or cat.get("provider")),
+        ]
+        for role, model, raw_provider in hops:
+            if not model:
+                continue
+            entry = models.setdefault(model, {
+                "id": model,
+                "object": "model",
+                "created": now_epoch(),
+                "owned_by": provider_name({"provider": raw_provider or "openai"}),
+                "hermes_router": {"categories": [], "roles": []},
+            })
+            meta = entry["hermes_router"]
+            if cat_name not in meta["categories"]:
+                meta["categories"].append(cat_name)
+            if role not in meta["roles"]:
+                meta["roles"].append(role)
+    return {"object": "list", "data": [models[k] for k in sorted(models)]}
 
 
 @app.post("/v1/chat/completions")

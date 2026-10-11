@@ -1,0 +1,85 @@
+{
+  "name": "golden_96_models",
+  "description": "GET /v1/models — OpenAI-compatible model listing (admin key); Stage 7 ingress plane",
+  "request": {
+    "method": "GET",
+    "path": "/v1/models",
+    "headers": {
+      "Authorization": "Bearer [set]"
+    },
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "object": "list",
+      "data": [
+        {
+          "id": "stub-anthropic",
+          "object": "model",
+          "created": 1727000000,
+          "owned_by": "anthropic",
+          "hermes_router": {
+            "categories": [
+              "anthropic"
+            ],
+            "roles": [
+              "primary"
+            ]
+          }
+        },
+        {
+          "id": "stub-complex",
+          "object": "model",
+          "created": 1727000000,
+          "owned_by": "openai",
+          "hermes_router": {
+            "categories": [
+              "complex"
+            ],
+            "roles": [
+              "primary"
+            ]
+          }
+        },
+        {
+          "id": "stub-fallback",
+          "object": "model",
+          "created": 1727000000,
+          "owned_by": "openai",
+          "hermes_router": {
+            "categories": [
+              "simple",
+              "anthropic",
+              "pooled_exhaust"
+            ],
+            "roles": [
+              "fallback"
+            ]
+          }
+        },
+        {
+          "id": "stub-simple",
+          "object": "model",
+          "created": 1727000000,
+          "owned_by": "openai",
+          "hermes_router": {
+            "categories": [
+              "simple",
+              "pooled",
+              "pooled_exhaust",
+              "pooled_stream",
+              "pooled_guard"
+            ],
+            "roles": [
+              "primary"
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "trace_events": [],
+  "volatile": false,
+  "notes": "Sorted, deduplicated model ids across categories with hermes_router tier metadata; created pinned by the fixed epoch"
+}

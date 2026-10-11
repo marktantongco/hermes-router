@@ -120,6 +120,10 @@ classifier:
 # ═══════════════════════════════════════════════════════════════════════════
 # Task Categories — define as many as you need
 # ═══════════════════════════════════════════════════════════════════════════
+# Every model configured below (primary + fallbacks, across all categories)
+# is listed by GET /v1/models — the OpenAI-compatible discovery surface
+# Hermes agents and BYOM clients consume (Stage 7). See
+# docs/HERMES_INTEGRATION.md for the agent onboarding guide.
 categories:
   chat:
     label: "Chat & Trivia"

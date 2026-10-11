@@ -1,6 +1,6 @@
 {
-  "captured": "2026-10-11T14:48:29Z",
-  "upstream_commit": "0c6cddb1d00c9c9c337f287ed078c700bc334ea9",
+  "captured": "2026-10-11T21:09:06Z",
+  "upstream_commit": "bee8169ecfd4f68b65ccb60fadeb5e6740dcdeb9",
   "router_config": {
     "server": {
       "host": "127.0.0.1",
@@ -248,6 +248,7 @@
     "Stage 4: scenarios 18-20 exercise virtual-key attribution, streaming usage capture, blocking budgets (402) and admin gating (403); random vk ids/tokens/hashes scrubbed to VK_A/VK_B/VK_C labels",
     "Stage 5: scenarios 21-24 pin the cost guard — principal request/token limiter boundaries (VK_D/VK_E with reconciliation proof), pool-scope gate (guard_pool) and the injected-402 watchdog; snapshot 93 pins the /admin/costguard state (VK_D/VK_E labels, ts scrubbed)",
     "Stage 6: snapshot 94 pins the first alert evaluation (budget:VK_C exhausted + billing_leak from 24a, both critical, raised_now == active); snapshot 95 pins the dashboard structure contract (section ids, zero-asset rule); /metrics gains the alerts_* counter family while the alerts section is enabled",
+    "Stage 7: snapshot 96 pins the /v1/models ingress surface (OpenAI list shape, deduplicated ids, hermes_router tier metadata) consumed by the Hermes agent and the model-provider plugin",
     "Re-capture at every stage boundary; diff = behavior regression signal"
   ],
   "fixtures": [
@@ -295,6 +296,7 @@
     "golden_94_admin_alerts",
     "golden_95_dashboard",
     "golden_90_health",
-    "golden_91_metrics"
+    "golden_91_metrics",
+    "golden_96_models"
   ]
 }

@@ -360,6 +360,7 @@ persona:
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
 | `/v1/chat/completions` | POST | Optional | OpenAI-compatible chat completions (routed) |
+| `/v1/models` | GET | Required | OpenAI-compatible model listing: every routable upstream model (primary + fallbacks), deduplicated, with tier metadata (Stage 7) |
 | `/health` | GET | None | Liveness check + active session count |
 | `/metrics` | GET | Required | Prometheus-compatible metrics |
 | `/reload` | POST | Required | Hot-reload `router_config.yaml` without restart |
@@ -410,6 +411,12 @@ If the env var is unset or empty, admin endpoints **reject all requests** (not o
 
 ## Point Hermes At It
 
+The full onboarding guide — both integration paths, model naming rules,
+virtual-key attribution, the streaming/tool-calling contract, the local
+Ollama lane and troubleshooting — lives in
+[`docs/HERMES_INTEGRATION.md`](docs/HERMES_INTEGRATION.md). The short
+form (Path A, `custom_providers`):
+
 In `~/.hermes/config.yaml`:
 
 ```yaml
@@ -432,6 +439,20 @@ fallback_providers:
 ```
 
 Then restart the Hermes gateway.
+
+Want the agent's model picker to list every routable gateway model
+(with tier structure) instead of one hard-coded name? Install the
+optional model-provider plugin:
+
+```bash
+mkdir -p ~/.hermes/plugins
+cp -r plugins/hermes-router-provider ~/.hermes/plugins/
+echo "HERMES_ROUTER_API_KEY=vk-..." >> ~/.hermes/.env   # virtual key recommended
+hermes gateway restart
+```
+
+See [`plugins/hermes-router-provider/README.md`](plugins/hermes-router-provider/README.md)
+for the pinned contract, configuration and verification steps.
 
 ---
 
