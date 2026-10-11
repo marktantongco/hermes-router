@@ -1,6 +1,6 @@
 {
   "name": "golden_92_admin_pools",
-  "description": "GET /admin/pools — per-key counters after scenarios 15-17 (cooldowns excluded)",
+  "description": "GET /admin/pools — per-key counters after the pool scenarios (15-17 rotation/exhaustion/stream + 23 guard_pool)",
   "request": {
     "method": "GET",
     "path": "/admin/pools",
@@ -104,9 +104,27 @@
               "consecutive_429": 0
             }
           ]
+        },
+        {
+          "name": "guard_pool",
+          "strategy": "round_robin",
+          "size": 1,
+          "keys": [
+            {
+              "key_id": "guard_pool/key-g",
+              "label": "key-g",
+              "capabilities": [],
+              "total_acquired": 1,
+              "total_429": 0,
+              "total_success": 1,
+              "total_auth_failures": 0,
+              "disabled": false,
+              "consecutive_429": 0
+            }
+          ]
         }
       ],
-      "count": 3
+      "count": 4
     }
   },
   "trace_events": [],

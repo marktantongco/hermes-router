@@ -1,0 +1,57 @@
+{
+  "name": "golden_21c_vk_d_request_two",
+  "description": "VK_D request 2/2 — admitted at the exact boundary (2/2), 200",
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "Authorization": "Bearer vk-[REDACTED]"
+    },
+    "body": {
+      "model": "auto",
+      "messages": [
+        {
+          "role": "user",
+          "content": "/use:simple guard request two"
+        }
+      ],
+      "stream": false
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "id": "chatcmpl-stub-golden",
+      "object": "chat.completion",
+      "created": 1727000000,
+      "model": "stub-simple",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Stub response for golden fixture."
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 5,
+        "completion_tokens": 6,
+        "total_tokens": 11
+      }
+    }
+  },
+  "trace_events": [
+    {
+      "event": "route",
+      "tier": "simple",
+      "model": "stub-simple",
+      "upstream_status": 200,
+      "stream": false,
+      "provider": "openai"
+    }
+  ],
+  "volatile": false,
+  "notes": "boundary admit: used 1+1 == limit 2; token window also at its boundary (8 est + 3 corr + 8 est = 19/19)"
+}

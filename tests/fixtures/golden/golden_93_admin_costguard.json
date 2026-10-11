@@ -1,0 +1,165 @@
+{
+  "name": "golden_93_admin_costguard",
+  "description": "GET /admin/costguard — limiters, in-window loads, pacer, watchdog, reconciliation, billing-visibility cross-check",
+  "request": {
+    "method": "GET",
+    "path": "/admin/costguard",
+    "headers": {
+      "Authorization": "Bearer [set]"
+    },
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "enabled": true,
+      "estimate_chars_per_token": 4.0,
+      "limiters": [
+        {
+          "name": "vk-two-requests",
+          "scope": "principal",
+          "dimension": "requests",
+          "limit": 2,
+          "window_seconds": 3600.0,
+          "admits": 6,
+          "blocks": 1,
+          "identities": {
+            "VK_A": {
+              "used": 1,
+              "events": 1
+            },
+            "VK_B": {
+              "used": 1,
+              "events": 1
+            },
+            "VK_C": {
+              "used": 1,
+              "events": 1
+            },
+            "VK_D": {
+              "used": 2,
+              "events": 2
+            },
+            "VK_E": {
+              "used": 1,
+              "events": 1
+            }
+          }
+        },
+        {
+          "name": "guard-pool-one-request",
+          "scope": "pool",
+          "dimension": "requests",
+          "limit": 1,
+          "window_seconds": 3600.0,
+          "admits": 4,
+          "blocks": 1,
+          "identities": {
+            "rotate_pool": {
+              "used": 1,
+              "events": 1
+            },
+            "exhaust_pool": {
+              "used": 1,
+              "events": 1
+            },
+            "stream_pool": {
+              "used": 1,
+              "events": 1
+            },
+            "guard_pool": {
+              "used": 1,
+              "events": 1
+            }
+          }
+        },
+        {
+          "name": "vk-token-budget",
+          "scope": "principal",
+          "dimension": "tokens",
+          "limit": 19,
+          "window_seconds": 3600.0,
+          "admits": 6,
+          "blocks": 1,
+          "identities": {
+            "VK_A": {
+              "used": 11,
+              "events": 2
+            },
+            "VK_B": {
+              "used": 11,
+              "events": 2
+            },
+            "VK_C": {
+              "used": 11,
+              "events": 2
+            },
+            "VK_D": {
+              "used": 22,
+              "events": 4
+            },
+            "VK_E": {
+              "used": 11,
+              "events": 2
+            }
+          }
+        },
+        {
+          "name": "global-requests",
+          "scope": "global",
+          "dimension": "requests",
+          "limit": 1000,
+          "window_seconds": 60.0,
+          "admits": 24,
+          "blocks": 0,
+          "identities": {
+            "global": {
+              "used": 24,
+              "events": 24
+            }
+          }
+        }
+      ],
+      "pacer": {
+        "enabled": true,
+        "requests_per_second": 100.0,
+        "max_burst": 50,
+        "pace_waits_total": 0,
+        "last_wait_seconds": 0.0
+      },
+      "watchdog": {
+        "statuses": [
+          401,
+          402
+        ],
+        "events_total": 1,
+        "by_status": {
+          "402": 1
+        },
+        "events": [
+          {
+            "ts": "[ts]",
+            "status": 402,
+            "model": "stub-complex",
+            "key_id": null
+          }
+        ],
+        "completions_total": 21,
+        "usage_missing_total": 0,
+        "billing_visibility": "ok",
+        "unbilled_completions": 0
+      },
+      "reconciliation": {
+        "estimates_total": 24,
+        "estimated_tokens_total": 222,
+        "reconciled_total": 21,
+        "actual_tokens_total": 238,
+        "unreconciled_total": 3,
+        "drift_tokens_total": 50
+      }
+    }
+  },
+  "trace_events": [],
+  "volatile": true,
+  "notes": "vk ids mapped to VK_* labels; watchdog event ts scrubbed; counters deterministic for this scenario order; pacer burst 50 >> capture traffic so pace_waits stays 0"
+}

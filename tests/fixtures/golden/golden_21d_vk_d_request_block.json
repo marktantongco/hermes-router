@@ -1,0 +1,43 @@
+{
+  "name": "golden_21d_vk_d_request_block",
+  "description": "VK_D request 3 — blocked 429 BEFORE routing (requests 2/2 used)",
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "Authorization": "Bearer vk-[REDACTED]"
+    },
+    "body": {
+      "model": "auto",
+      "stream": false,
+      "messages": [
+        {
+          "role": "user",
+          "content": "/use:simple guard request three"
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 429,
+    "body": {
+      "error": {
+        "message": "Cost guard limiter exceeded",
+        "type": "cost_guard_rate_limited",
+        "detail": {
+          "limiter": "vk-two-requests",
+          "scope": "principal",
+          "identity": "VK_D",
+          "dimension": "requests",
+          "limit": 2,
+          "used": 2,
+          "window_seconds": 3600.0,
+          "retry_after_seconds": "[computed]"
+        }
+      }
+    }
+  },
+  "trace_events": [],
+  "volatile": false,
+  "notes": "cost_guard_rate_limited; detail pins limiter/scope/dimension/limit/used; retry_after is timing-derived (scrubbed); no trace events — the request never routed"
+}

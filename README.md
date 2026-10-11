@@ -252,6 +252,36 @@ curl /admin/ledger/verify -H "Authorization: Bearer $ADMIN"
 
 Ledger failures never break proxying — a failed append is counted (`ledger_append_failures_total`) and logged, and the request still completes. With `ledger.enabled: false` the whole plane is inert (admin ledger endpoints answer `409 ledger_disabled`).
 
+### Cost Guard (Stage 5)
+
+Admission control sits **between the Stage 4 budget gate and upstream dispatch** (a spent budget still reports `402`, not `429`): sliding-window limiters first, then a token-bucket pacer. Rejected requests never reach a provider.
+
+* **Limiters** are true sliding windows in three scopes: `principal` (per virtual key; the gateway admin key is exempt, mirroring the budget gate), `pool` (per key-pool ceiling enforced at the pooled dispatch door — a blocked attempt behaves exactly like pool exhaustion, so the fallback cascade advances behind a synthetic 429), and `global` (every request, admin included). Each limiter sets exactly one dimension: `requests` or `tokens`.
+* **Estimate-to-actual reconciliation** — token windows admit a prompt estimate (`chars / estimate_chars_per_token`); when the completion's real usage lands at the ledger choke point, a signed correction swaps the estimate for the actual total, so windows hold exact usage. Pool windows keep the estimate on purpose (each upstream attempt genuinely consumed prompt tokens). Drift is reported for the R6 reconciliation audit.
+* **Pacer** — `max_burst` immediate admits, then a steady `requests_per_second`, so bursts smooth out instead of tripping provider 429s.
+* **Billing-leak watchdog** — upstream `401`/`402` (configurable) are recorded as billing signals; the report cross-checks completions against ledger appends (`billing_visibility: ok | leaking`).
+
+```yaml
+cost_guard:
+  enabled: true
+  estimate_chars_per_token: 4
+  limiters:
+    - {name: per-key-rpm, scope: principal, requests: 30, window_seconds: 60}
+    - {name: per-key-tpm, scope: principal, tokens: 60000, window_seconds: 60}
+    - {name: tier-rpd, scope: pool, requests: 14400, window_seconds: 86400}
+    - {name: global-safety, scope: global, requests: 600, window_seconds: 60}
+  pacer: {requests_per_second: 10, max_burst: 20}
+  watchdog: {statuses: [401, 402]}
+```
+
+A blocked request returns `429 cost_guard_rate_limited` with the full limiter verdict (limiter, scope, dimension, limit, used, retry hint). Live state — window loads per identity, admits/blocks, pacer waits, watchdog events, reconciliation counters — is one call away:
+
+```bash
+curl /admin/costguard -H "Authorization: Bearer $ADMIN"
+```
+
+Invalid `cost_guard` configuration refuses startup and hot-reload (fail-closed); an absent section disables the guard with zero behavior change.
+
 ### Circuit Breaker
 
 ```yaml
@@ -317,6 +347,7 @@ persona:
 | `/admin/ledger/verify` | GET | Required | Recompute the full hash chain — tamper evidence (Stage 4) |
 | `/admin/ledger/records` | GET | Required | Recent cost records; `?virtual_key_id=` filters per subscriber (Stage 4) |
 | `/admin/ledger/summary` | GET | Required | Aggregate spend: `?group_by=model\|key\|session\|day` (Stage 4) |
+| `/admin/costguard` | GET | Required | Cost-guard snapshot: limiters, window loads, pacer, watchdog, reconciliation (Stage 5) |
 | `/circuits` | GET | Required | List all circuit breaker states |
 | `/circuits/reset` | POST | Required | Reset all circuit breakers to closed |
 | `/classifier/report` | GET | Required | Surrogate coverage, confidence distribution, routing stats, drift timeline. `?format=html` for dark-themed dashboard |

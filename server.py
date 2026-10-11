@@ -148,6 +148,15 @@ except ImportError:  # ledger unavailable -> proxy works, billing plane off
         return {"blocked": False, "mode": "none", "limit": 0,
                 "period": "total", "used": 0}
 
+# ── Cost guard (Stage 5) — limiters, pacer, billing-leak watchdog ─────
+try:
+    from costguard import CostGuardError, build_cost_guard
+except ImportError:  # costguard unavailable -> guard off, proxy unaffected
+    class CostGuardError(RuntimeError):  # type: ignore[misc,no-redef]
+        pass
+    def build_cost_guard(cfg):  # type: ignore[misc,no-redef]
+        return None
+
 # ── Zero-shot embedding classifier (optional, no LLM needed) ──────────────
 try:
     from zero_shot_classifier import get_zero_shot
@@ -1321,9 +1330,22 @@ def _ledger_append(
     vk_id: str | None,
     usage: dict[str, int] | None = None,
     status: str = "ok",
+    cg_ticket: Any = None,
 ) -> None:
     """Append one cost record. NEVER raises: billing failures must not
-    break proxying — they are counted and logged instead."""
+    break proxying — they are counted and logged instead.
+
+    Stage 5: this is the single choke point where every completion lands,
+    so the cost guard's estimate-to-actual reconciliation hooks here —
+    usage present reconciles the admission ticket; usage None abandons it
+    (counted as unreconciled for the watchdog's reconciliation report)."""
+    if _COST_GUARD is not None:
+        _COST_GUARD.note_completion(has_usage=usage is not None)
+        if cg_ticket is not None:
+            if usage is not None:
+                _COST_GUARD.reconcile(cg_ticket, usage)
+            else:
+                _COST_GUARD.abandon(cg_ticket)
     if _LEDGER is None or _PRICING is None:
         return
     try:
@@ -1374,6 +1396,7 @@ def _ledger_append_from_response(
     key_id: str | None,
     fallback_level: int,
     vk_id: str | None,
+    cg_ticket: Any = None,
 ) -> None:
     """Non-streaming append: usage from the (translated) response body."""
     usage = None
@@ -1384,7 +1407,45 @@ def _ledger_append_from_response(
         status = "ok"
     _ledger_append(session_key=session_key, attempt_cfg=model_cfg, stream=False,
                    key_id=key_id, fallback_level=fallback_level, vk_id=vk_id,
-                   usage=usage, status=status)
+                   usage=usage, status=status, cg_ticket=cg_ticket)
+
+
+def _cg_abandon(cg_ticket: Any) -> None:
+    """Stage 5: request ended without a completion record (never routed,
+    all upstreams failed, or an early contract error) — the admission
+    estimate stays in the windows (conservative) and the ticket is counted
+    as unreconciled for the reconciliation report."""
+    if cg_ticket is not None and _COST_GUARD is not None:
+        _COST_GUARD.abandon(cg_ticket)
+
+
+_COST_GUARD: Any = None  # costguard.CostGuard | None (Stage 5)
+
+
+def _stage5_bootstrap(cfg: dict) -> list[str]:
+    """Build the cost guard; returns fatal errors (empty == ok).
+
+    All-or-nothing like the other stage bootstraps: a rejected candidate
+    config leaves the previous guard live. An absent/disabled section
+    clears the guard (reload path). The guard carries no handles to close
+    — state is in-memory only, so the swap is trivially atomic.
+    """
+    global _COST_GUARD
+    try:
+        guard = build_cost_guard(cfg)
+    except CostGuardError as exc:
+        return [f"cost_guard: {exc}"]
+    except Exception as exc:  # noqa: BLE001 — bootstrap must be precise
+        return [f"cost_guard: unexpected {type(exc).__name__}: {exc}"]
+    _COST_GUARD = guard
+    if guard is not None:
+        log.info("  Cost guard: enabled (%d limiters, pacer %s, watchdog %s)",
+                 len(guard.limiters),
+                 "on" if guard.pacer is not None else "off",
+                 ",".join(str(s) for s in sorted(guard.watchdog_statuses)))
+    else:
+        log.info("  Cost guard: disabled (no cost_guard section)")
+    return []
 
 
 def _stage4_bootstrap(cfg: dict) -> list[str]:
@@ -1472,6 +1533,26 @@ async def call_model(
 
     # ── Pooled dispatch (Stage 3) ───────────────────────────────────────────
     if pool is not None:
+        # Stage 5: pool-scope ceilings at the pooled dispatch door — blocked
+        # attempts yield a synthetic 429 so the fallback cascade advances
+        # exactly like pool exhaustion / an open circuit.
+        if _COST_GUARD is not None:
+            cg_block = _COST_GUARD.pool_gate(pool.name, request_payload)
+            if cg_block is not None:
+                log.warning(
+                    "Cost guard pool gate blocked %s on pool %s: limiter %s "
+                    "used %d/%d",
+                    model_name, pool.name, cg_block["limiter"],
+                    cg_block["used"], cg_block["limit"])
+                r = httpx.Response(429, json={
+                    "error": {
+                        "message": f"Key pool '{pool.name}' blocked by cost "
+                                   f"guard limiter '{cg_block['limiter']}'",
+                        "type": "cost_guard_rate_limited",
+                    }})
+                r._request = httpx.Request("POST", url)
+                return r
+
         # Request translation is key-independent; only auth headers rotate.
         payload = provider.translate_request(request_payload, model_cfg)
         resp: httpx.Response | None = None
@@ -1495,6 +1576,13 @@ async def call_model(
                     timeout=httpx.Timeout(timeout),
                     label=f"call_model({model_name})",
                 )
+                # Stage 5: billing-leak watchdog — 401/402 on a pooled key
+                # means the flat-cost lane is degrading (Stage 3 owns the
+                # rotation/quarantine; this records the billing signal).
+                if _COST_GUARD is not None \
+                        and resp.status_code in _COST_GUARD.watchdog_statuses:
+                    _COST_GUARD.observe_upstream(
+                        resp.status_code, model_name, lease.key_id)
                 if resp.status_code in (401, 403):
                     pool.report_result(lease.key_id, resp.status_code)
                     _inc_metric("pool_auth_failures_total")
@@ -1596,6 +1684,11 @@ async def call_model(
                 _circuit_record_success(cfg, base_url, model_name)
                 _clear_retry(session_key(request_payload.get("messages", [])) or "")
 
+    # Stage 5: billing-leak watchdog on the single-key lane's final outcome
+    # (covers the primary response and the alternate-key retry result).
+    if _COST_GUARD is not None and resp.status_code in _COST_GUARD.watchdog_statuses:
+        _COST_GUARD.observe_upstream(resp.status_code, model_name, None)
+
     # Stage 2: translate provider-native success bodies to the OpenAI shape.
     return _translate_ok(provider, resp, request_payload, model_cfg)
 
@@ -1623,7 +1716,8 @@ def _should_use_fallback(key: str) -> bool:
 
 
 async def route_request_stream(cfg: dict, payload: dict,
-                               virtual_key_id: str | None = None):
+                               virtual_key_id: str | None = None,
+                               cg_ticket: Any = None):
     """Streaming version of route_request — returns SSE chunks from upstream.
 
     Acts as a transparent proxy: opens an inner stream to the selected
@@ -1635,10 +1729,17 @@ async def route_request_stream(cfg: dict, payload: dict,
 
     Stage 4: ``virtual_key_id`` attributes the cost record when a virtual
     key authenticated the request (None = admin gateway key).
+
+    Stage 5: ``cg_ticket`` carries the cost-guard admission estimate to
+    the ledger choke point — reconciled on clean completion, abandoned on
+    interruption / terminal failure (a client disconnect mid-stream can
+    leave the ticket open; the estimate staying in the windows is the
+    conservative direction).
     """
     messages = payload.get("messages", [])
     key = session_key(messages)
     if not key:
+        _cg_abandon(cg_ticket)
         yield b'data: {"error":{"message":"No user message found","type":"router_error"}}\n\ndata: [DONE]\n\n'
         return
 
@@ -1711,6 +1812,7 @@ async def route_request_stream(cfg: dict, payload: dict,
 
     model_cfg = cfg["categories"].get(category, {})
     if not model_cfg:
+        _cg_abandon(cg_ticket)
         yield b'data: {"error":{"message":"Category has no model config","type":"router_error"}}\n\ndata: [DONE]\n\n'
         return
     model_cfg = model_cfg.copy()
@@ -1816,6 +1918,26 @@ async def route_request_stream(cfg: dict, payload: dict,
                     )
                     continue  # try next tier
 
+                # Stage 5: pool-scope ceilings at the pooled dispatch door —
+                # a blocked pool behaves exactly like an exhausted one for
+                # this tier (synthetic 429 semantics, cascade advances).
+                if _COST_GUARD is not None and pool is not None:
+                    cg_block = _COST_GUARD.pool_gate(pool.name, payload)
+                    if cg_block is not None:
+                        log.warning(
+                            "Cost guard pool gate blocked %s on pool %s: "
+                            "limiter %s used %d/%d",
+                            model_name, pool.name, cg_block["limiter"],
+                            cg_block["used"], cg_block["limit"])
+                        trace_route(
+                            session_key=key, tier=category, model=model_name,
+                            upstream_status=429, stream=True,
+                            fallback_level=attempt_idx + 1,
+                            provider=provider.name,
+                        )
+                        _inc_metric_tier(category, "429")
+                        continue  # try next tier
+
             api_key = env_key(attempt_cfg.get("api_key_env", ""))
             alt_key = env_key(attempt_cfg.get("alternate_key_env", ""))
             timeout = attempt_cfg.get("timeout_seconds", 120)
@@ -1895,6 +2017,15 @@ async def route_request_stream(cfg: dict, payload: dict,
                             err_body = await resp.aread()
                             err_text = err_body.decode(errors="replace")[:300]
 
+                            # Stage 5: billing-leak watchdog — 401/402 are
+                            # billing signals on the stream lane (credential
+                            # death / provider payment walls).
+                            if _COST_GUARD is not None \
+                                    and resp.status_code in _COST_GUARD.watchdog_statuses:
+                                _COST_GUARD.observe_upstream(
+                                    resp.status_code, model_name,
+                                    key_label if pool is not None else None)
+
                             # Stage 3: quarantine pooled keys on auth failures
                             if pool is not None and resp.status_code in (401, 403):
                                 pool.report_result(key_label, resp.status_code)
@@ -1955,7 +2086,7 @@ async def route_request_stream(cfg: dict, payload: dict,
                                                         fallback_level=attempt_level,
                                                         vk_id=virtual_key_id,
                                                         usage=retry_sniffer.usage,
-                                                        status="ok")
+                                                        status="ok", cg_ticket=cg_ticket)
                                                     _clear_retry(key)
                                                     return  # clean completion
                                                 except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as stream_exc:
@@ -1965,7 +2096,8 @@ async def route_request_stream(cfg: dict, payload: dict,
                                                         stream=True, key_id=key_label,
                                                         fallback_level=attempt_level,
                                                         vk_id=virtual_key_id,
-                                                        usage=None, status="interrupted")
+                                                        usage=None, status="interrupted",
+                                                        cg_ticket=cg_ticket)
                                                     log.warning("Stream interrupted for %s after 503 retry: %s", model_name, stream_exc)
                                                     cnt = _record_failure(key)
                                                     trace_stream_error(
@@ -1984,6 +2116,13 @@ async def route_request_stream(cfg: dict, payload: dict,
                                             # Non-200, non-429 — continue retrying
                                             err_body = await retry_resp.aread()
                                             err_text = err_body.decode(errors="replace")[:300]
+                                            # Stage 5: billing-leak watchdog on
+                                            # the 503-retry outcome too
+                                            if _COST_GUARD is not None \
+                                                    and retry_resp.status_code in _COST_GUARD.watchdog_statuses:
+                                                _COST_GUARD.observe_upstream(
+                                                    retry_resp.status_code, model_name,
+                                                    key_label if pool is not None else None)
                                     except (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError, httpx.ConnectTimeout):
                                         continue  # transport error on retry, try again
                                 # All 503 retries exhausted — fall through to next tier
@@ -2024,7 +2163,8 @@ async def route_request_stream(cfg: dict, payload: dict,
                                 stream=True, key_id=key_label,
                                 fallback_level=attempt_level,
                                 vk_id=virtual_key_id,
-                                usage=sniffer.usage, status="ok")
+                                usage=sniffer.usage, status="ok",
+                                cg_ticket=cg_ticket)
                             _clear_retry(key)
                             return  # clean completion
 
@@ -2035,7 +2175,8 @@ async def route_request_stream(cfg: dict, payload: dict,
                                 stream=True, key_id=key_label,
                                 fallback_level=attempt_level,
                                 vk_id=virtual_key_id,
-                                usage=None, status="interrupted")
+                                usage=None, status="interrupted",
+                                cg_ticket=cg_ticket)
                             log.warning("Stream interrupted for %s: %s", model_name, stream_exc)
                             cnt = _record_failure(key)
                             trace_stream_error(
@@ -2065,22 +2206,29 @@ async def route_request_stream(cfg: dict, payload: dict,
 
     # ── All tiers exhausted ────────────────────────────────────────
     log.error("All streaming tiers exhausted for session %s", key)
+    _cg_abandon(cg_ticket)
     yield b'data: {"error":{"message":"All upstream models failed","type":"upstream_error"}}\n\n'
     yield b'data: [DONE]\n\n'
 
 
 async def route_request(cfg: dict, payload: dict,
-                        virtual_key_id: str | None = None) -> JSONResponse:
+                        virtual_key_id: str | None = None,
+                        cg_ticket: Any = None) -> JSONResponse:
     """
     Full routing pipeline.  Determines the category, calls the mapped
     model (with fallback), and returns a FastAPI JSONResponse.
 
     Stage 4: ``virtual_key_id`` attributes the cost record when a virtual
     key authenticated the request (None = admin gateway key).
+
+    Stage 5: ``cg_ticket`` carries the cost-guard admission estimate to
+    the ledger choke point — reconciled on completion, abandoned when the
+    request dies without one (terminal failure / early contract error).
     """
     messages = payload.get("messages", [])
     key = session_key(messages)
     if not key:
+        _cg_abandon(cg_ticket)
         return _error(400, "No user message found in request")
 
     # ── Determine category ──────────────────────────────────────────────
@@ -2163,6 +2311,7 @@ async def route_request(cfg: dict, payload: dict,
     # ── Call model ──────────────────────────────────────────────────────
     cat_cfg = cfg["categories"].get(category, {}).copy()
     if not cat_cfg:
+        _cg_abandon(cg_ticket)
         return _error(500, f"Category '{category}' has no model config")
     cat_cfg["tier"] = category  # for circuit breaker metric labeling
     _inc_metric_tier(category, "requests_total")
@@ -2190,7 +2339,7 @@ async def route_request(cfg: dict, payload: dict,
             _ledger_append_from_response(
                 session_key=key, model_cfg=cat_cfg, data=data,
                 key_id=getattr(resp, "_hermes_key_id", None),
-                fallback_level=0, vk_id=virtual_key_id)
+                fallback_level=0, vk_id=virtual_key_id, cg_ticket=cg_ticket)
             return JSONResponse(content=data)
     else:
         resp = httpx.Response(503, text="Skipped primary due to consecutive failures")
@@ -2199,6 +2348,7 @@ async def route_request(cfg: dict, payload: dict,
     # ── Fallback ────────────────────────────────────────────────────────
     fallback_model = cat_cfg.get("fallback_model")
     if not fallback_model:
+        _cg_abandon(cg_ticket)
         return _proxy_error(resp)
 
     log.warning(
@@ -2243,7 +2393,7 @@ async def route_request(cfg: dict, payload: dict,
         _ledger_append_from_response(
             session_key=key, model_cfg=fb_cfg, data=data,
             key_id=getattr(fb_resp, "_hermes_key_id", None),
-            fallback_level=1, vk_id=virtual_key_id)
+            fallback_level=1, vk_id=virtual_key_id, cg_ticket=cg_ticket)
         return JSONResponse(content=data)
 
     # ── Fallback 2 ─────────────────────────────────────────────────────────
@@ -2286,10 +2436,12 @@ async def route_request(cfg: dict, payload: dict,
             _ledger_append_from_response(
                 session_key=key, model_cfg=fb2_cfg, data=data,
                 key_id=getattr(fb2_resp, "_hermes_key_id", None),
-                fallback_level=2, vk_id=virtual_key_id)
+                fallback_level=2, vk_id=virtual_key_id, cg_ticket=cg_ticket)
             return JSONResponse(content=data)
+        _cg_abandon(cg_ticket)
         return _proxy_error(fb2_resp)
 
+    _cg_abandon(cg_ticket)
     return _proxy_error(fb_resp)
 
 
@@ -2527,6 +2679,10 @@ def _startup() -> None:
     for fatal in _stage4_bootstrap(cfg):
         log.fatal("Refusing to start: %s", fatal)
         sys.exit(1)
+    # Stage 5: cost guard (fail-closed; no cost_guard section = off)
+    for fatal in _stage5_bootstrap(cfg):
+        log.fatal("Refusing to start: %s", fatal)
+        sys.exit(1)
     log.info("Router starting on %s:%s", cfg["server"]["host"], cfg["server"]["port"])
     log.info("  Classifier: %s (%s)", cfg["classifier"]["model"], cfg["classifier"]["base_url"])
     cats = cfg.get("categories", {})
@@ -2637,6 +2793,15 @@ async def reload_config(request: Request):
         raise HTTPException(
             status_code=400,
             detail={"error": {"message": "; ".join(stage4_errors), "type": "reload_error"}},
+        )
+
+    # Stage 5: cost guard must rebuild before the swap is accepted (same
+    # all-or-nothing guarantee; an absent section clears the guard).
+    stage5_errors = _stage5_bootstrap(new_cfg)
+    if stage5_errors:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"message": "; ".join(stage5_errors), "type": "reload_error"}},
         )
 
     # Clear profile_hint so extraction runs with fresh config
@@ -3082,6 +3247,18 @@ async def unlock_pool(name: str, request: Request):
     return {"status": "unlocked", "pool": name, "keys_reset": reset}
 
 
+@app.get("/admin/costguard")
+async def costguard_status(request: Request):
+    """Stage 5: cost guard snapshot — limiters, pacer, watchdog,
+    reconciliation, and billing-visibility cross-check."""
+    verify_auth(request, require_admin=True)
+    if _COST_GUARD is None:
+        return {"enabled": False}
+    return _COST_GUARD.describe(
+        ledger_enabled=_LEDGER is not None,
+        ledger_appends=METRICS.get("ledger_appends_total", 0))
+
+
 @app.get("/admin/catalog")
 async def get_catalog(request: Request):
     """Stage 3: free-tier catalog summary (provider facts + limits)."""
@@ -3303,15 +3480,54 @@ async def chat_completions(request: Request):
     vk_id = (principal["vk"]["id"]
              if principal["kind"] == "virtual_key" else None)
     payload = await request.json()
+
+    # Stage 5: cost-guard admission — principal/global limiters run BEFORE
+    # any routing (rejected requests never reach a provider, Ch. 8.2), then
+    # the pacer smooths dispatch under configured ceilings. Budget blocks
+    # (Stage 4, above) keep precedence: a spent budget reports 402, not 429.
+    cg_ticket: Any = None
+    if _COST_GUARD is not None:
+        cg_ticket, cg_block = _COST_GUARD.preflight(
+            payload, principal_id=vk_id or "admin",
+            is_admin=principal["kind"] != "virtual_key")
+        if cg_block is not None:
+            log.warning("Cost guard blocked %s: limiter %s used %d/%d (%s)",
+                        vk_id or "admin", cg_block["limiter"],
+                        cg_block["used"], cg_block["limit"],
+                        cg_block["dimension"])
+            return JSONResponse(status_code=429, content={
+                "error": {
+                    "message": "Cost guard limiter exceeded",
+                    "type": "cost_guard_rate_limited",
+                    "detail": {
+                        "limiter": cg_block["limiter"],
+                        "scope": cg_block["scope"],
+                        "identity": cg_block["identity"],
+                        "dimension": cg_block["dimension"],
+                        "limit": cg_block["limit"],
+                        "used": cg_block["used"],
+                        "window_seconds": cg_block["window_seconds"],
+                        "retry_after_seconds": cg_block["retry_after_seconds"],
+                    },
+                }})
+        pace_wait = _COST_GUARD.pace()
+        if pace_wait > 0:
+            await asyncio.sleep(pace_wait)
+
     try:
         if payload.get("stream"):
             _inc_metric("stream_requests_total")
             return StreamingResponse(
-                route_request_stream(cfg, payload, virtual_key_id=vk_id),
+                route_request_stream(cfg, payload, virtual_key_id=vk_id,
+                                     cg_ticket=cg_ticket),
                 media_type="text/event-stream",
             )
-        return await route_request(cfg, payload, virtual_key_id=vk_id)
+        return await route_request(cfg, payload, virtual_key_id=vk_id,
+                                   cg_ticket=cg_ticket)
     except Exception:
+        # The request died before any completion record could land — count
+        # the admission estimate as unreconciled (conservative).
+        _cg_abandon(cg_ticket)
         _inc_metric("errors_total")
         raise
 
@@ -3419,6 +3635,40 @@ async def metrics(request: Request):
         f"hermes_router_ledger_budget_blocks_total {m.get('ledger_budget_blocks_total', 0)}",
         "",
     ]
+    # Stage 5: cost guard counters (the guard is the single source; both
+    # surfaces carry the section only while the guard is enabled)
+    if _COST_GUARD is not None:
+        cg = _COST_GUARD.stats()
+        m.update(cg)
+        lines += [
+            "# HELP hermes_router_cost_guard_blocks_total Requests refused by cost guard limiters",
+            "# TYPE hermes_router_cost_guard_blocks_total counter",
+            f"hermes_router_cost_guard_blocks_total {cg['cost_guard_blocks_total']}",
+            "# HELP hermes_router_cost_guard_pace_waits_total Dispatches held back by the pacer",
+            "# TYPE hermes_router_cost_guard_pace_waits_total counter",
+            f"hermes_router_cost_guard_pace_waits_total {cg['cost_guard_pace_waits_total']}",
+            "# HELP hermes_router_cost_guard_watchdog_events_total Billing-leak signals observed (401/402)",
+            "# TYPE hermes_router_cost_guard_watchdog_events_total counter",
+            f"hermes_router_cost_guard_watchdog_events_total {cg['cost_guard_watchdog_events_total']}",
+            "# HELP hermes_router_cost_guard_completions_total Completions seen at the ledger choke point",
+            "# TYPE hermes_router_cost_guard_completions_total counter",
+            f"hermes_router_cost_guard_completions_total {cg['cost_guard_completions_total']}",
+            "# HELP hermes_router_cost_guard_usage_missing_total Completions without usage data",
+            "# TYPE hermes_router_cost_guard_usage_missing_total counter",
+            f"hermes_router_cost_guard_usage_missing_total {cg['cost_guard_usage_missing_total']}",
+            "# HELP hermes_router_cost_guard_estimates_total Requests admitted with a token estimate",
+            "# TYPE hermes_router_cost_guard_estimates_total counter",
+            f"hermes_router_cost_guard_estimates_total {cg['cost_guard_estimates_total']}",
+            "# HELP hermes_router_cost_guard_reconciled_total Estimates reconciled to actual usage",
+            "# TYPE hermes_router_cost_guard_reconciled_total counter",
+            f"hermes_router_cost_guard_reconciled_total {cg['cost_guard_reconciled_total']}",
+            "# HELP hermes_router_cost_guard_unreconciled_total Admissions abandoned without usage",
+            "# TYPE hermes_router_cost_guard_unreconciled_total counter",
+            f"hermes_router_cost_guard_unreconciled_total {cg['cost_guard_unreconciled_total']}",
+            "# HELP hermes_router_cost_guard_estimate_drift_tokens_total Absolute estimate-vs-actual token drift",
+            "# TYPE hermes_router_cost_guard_estimate_drift_tokens_total counter",
+            f"hermes_router_cost_guard_estimate_drift_tokens_total {cg['cost_guard_estimate_drift_tokens_total']}",
+        ]
     return JSONResponse(
         content={"metrics": m, "prometheus": "\n".join(lines)},
     )
@@ -3450,6 +3700,11 @@ if __name__ == "__main__":
     # Stage 4: billing plane must build before the socket binds.
     for s4_err in _stage4_bootstrap(cfg):
         log.fatal("Refusing to start: %s", s4_err)
+        sys.exit(1)
+
+    # Stage 5: cost guard must build before the socket binds.
+    for s5_err in _stage5_bootstrap(cfg):
+        log.fatal("Refusing to start: %s", s5_err)
         sys.exit(1)
 
     # Stage 1: localhost is the default bind. Environment overrides exist for

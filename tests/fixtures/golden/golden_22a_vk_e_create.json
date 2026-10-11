@@ -1,0 +1,30 @@
+{
+  "name": "golden_22a_vk_e_create",
+  "description": "POST /admin/virtual_keys — create VK_E (none)",
+  "request": {
+    "method": "POST",
+    "path": "/admin/virtual_keys",
+    "headers": {
+      "Authorization": "Bearer [set]"
+    },
+    "body": {
+      "name": "subscriber-e"
+    }
+  },
+  "response": {
+    "status": 201,
+    "body": {
+      "id": "VK_E",
+      "name": "subscriber-e",
+      "created_at": "[ts]",
+      "enabled": 1,
+      "budget_mode": "none",
+      "budget_limit": 0,
+      "budget_period": "total",
+      "key": "vk-[REDACTED]"
+    }
+  },
+  "trace_events": [],
+  "volatile": false,
+  "notes": "Plaintext token shown once (redacted here); only its SHA-256 is stored server-side"
+}

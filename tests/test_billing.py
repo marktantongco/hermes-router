@@ -31,7 +31,7 @@ import uvicorn
 REPO = Path(__file__).resolve().parents[1]
 
 RUNTIME_FILES = ["server.py", "providers.py", "trace.py", "keystore.py",
-                 "keypool.py", "catalog.py", "ledger.py",
+                 "keypool.py", "catalog.py", "ledger.py", "costguard.py",
                  "surrogate_models.py", "zero_shot_classifier.py",
                  "fasttext_classifier.py", "setfit_classifier.py"]
 

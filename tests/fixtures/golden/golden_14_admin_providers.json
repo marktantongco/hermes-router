@@ -66,6 +66,9 @@
         },
         "pooled_stream": {
           "provider": "openai"
+        },
+        "pooled_guard": {
+          "provider": "openai"
         }
       }
     }

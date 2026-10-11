@@ -47,9 +47,20 @@ def test_fixture_suite_is_present():
         "golden_19c_budget_block_402",
         "golden_19d_virtual_keys_listing",
         "golden_20_vk_admin_forbidden",
+        "golden_21a_vk_d_create",
+        "golden_21b_vk_d_request_one",
+        "golden_21c_vk_d_request_two",
+        "golden_21d_vk_d_request_block",
+        "golden_22a_vk_e_create",
+        "golden_22b_vk_e_reconcile_admit",
+        "golden_22c_vk_e_token_block",
+        "golden_23a_pool_gate_admit",
+        "golden_23b_pool_gate_block",
+        "golden_24a_watchdog_402",
         "golden_90_health",
         "golden_91_metrics",
         "golden_92_admin_pools",
+        "golden_93_admin_costguard",
     ]:
         assert required in names, f"missing fixture: {required}"
 
@@ -336,20 +347,27 @@ def test_17_pool_stream_rotation_contract():
 
 
 def test_92_admin_pools_contract():
-    """Pool state after 15-17: counters deterministic, secrets absent."""
+    """Pool state after 15-17 + 23: counters deterministic, secrets absent."""
     d = _load("golden_92_admin_pools")
     body = d["response"]["body"]
     assert d["response"]["status"] == 200
-    assert body["count"] == 3
+    assert body["count"] == 4
     pools = {p["name"]: p for p in body["pools"]}
-    assert set(pools) == {"rotate_pool", "exhaust_pool", "stream_pool"}
-    assert all(p["strategy"] == "round_robin" and p["size"] == 2
-               for p in pools.values())
+    assert set(pools) == {"rotate_pool", "exhaust_pool", "stream_pool",
+                          "guard_pool"}
+    assert all(p["strategy"] == "round_robin" for p in pools.values())
+    assert all(pools[n]["size"] == 2 for n in
+               ("rotate_pool", "exhaust_pool", "stream_pool"))
+    assert pools["guard_pool"]["size"] == 1
     keys = {k["label"]: k for p in pools.values() for k in p["keys"]}
     assert keys["key-a"]["total_429"] == 1 and keys["key-a"]["total_success"] == 0
     assert keys["key-b"]["total_success"] == 1
     assert keys["key-c"]["total_429"] == 1 and keys["key-d"]["total_429"] == 1
     assert keys["key-e"]["total_429"] == 1 and keys["key-f"]["total_success"] == 1
+    # Stage 5: guard_pool served exactly one request (scenario 23a)
+    assert keys["key-g"]["total_acquired"] == 1
+    assert keys["key-g"]["total_success"] == 1
+    assert keys["key-g"]["total_429"] == 0
     assert keys["key-a"]["consecutive_429"] == 1
     assert not any(k["disabled"] for k in keys.values())
     # no secret material anywhere in the admin surface
@@ -455,3 +473,126 @@ def test_no_vk_plaintext_tokens_in_fixtures():
             f"possible plaintext token leak in {path.name}"
         assert "[REDACTED]" in raw or '"key"' not in raw, \
             f"unredacted key field in {path.name}"
+
+
+# ── Stage 5 cost-guard contracts ─────────────────────────────────────────
+
+def test_21_request_limiter_boundary_contract():
+    """Principal-scope request limiter: two admits, third blocked pre-routing."""
+    create = _load("golden_21a_vk_d_create")["response"]
+    assert create["status"] == 201
+    assert create["body"]["name"] == "subscriber-d"
+    for name in ("golden_21b_vk_d_request_one", "golden_21c_vk_d_request_two"):
+        d = _load(name)
+        assert d["response"]["status"] == 200
+        assert d["response"]["body"]["model"] == "stub-simple"
+        assert d["request"]["headers"]["Authorization"] == "Bearer vk-[REDACTED]"
+    blocked = _load("golden_21d_vk_d_request_block")
+    assert blocked["response"]["status"] == 429
+    err = blocked["response"]["body"]["error"]
+    assert err["type"] == "cost_guard_rate_limited"
+    detail = err["detail"]
+    assert detail["limiter"] == "vk-two-requests"
+    assert detail["scope"] == "principal" and detail["dimension"] == "requests"
+    assert detail["identity"] == "VK_D"          # scrubbed to the stable label
+    assert detail["used"] == 2 and detail["limit"] == 2
+    assert detail["retry_after_seconds"] == "[computed]"  # timing-derived
+    assert blocked["trace_events"] == []           # never routed
+
+
+def test_22_token_reconciliation_boundary_contract():
+    """Estimate-to-actual reconciliation proven by the block arithmetic:
+    estimates alone (9+9=18) fit the 19-token limit; the reconciled window
+    (11) + new estimate (9) = 20 does not. used=11 is the proof."""
+    assert _load("golden_22a_vk_e_create")["response"]["status"] == 201
+    admitted = _load("golden_22b_vk_e_reconcile_admit")
+    assert admitted["response"]["status"] == 200
+    blocked = _load("golden_22c_vk_e_token_block")
+    assert blocked["response"]["status"] == 429
+    detail = blocked["response"]["body"]["error"]["detail"]
+    assert detail["limiter"] == "vk-token-budget"
+    assert detail["dimension"] == "tokens"
+    assert detail["identity"] == "VK_E"
+    assert detail["used"] == 11 and detail["limit"] == 19
+    assert blocked["trace_events"] == []
+
+
+def test_23_pool_gate_boundary_contract():
+    """Pool-scope ceiling at the dispatch door: first request served by the
+    pooled key, second becomes a synthetic 429 (Stage 3 pool-exhaustion
+    semantics) and — with no fallback tier — surfaces as the 502 envelope."""
+    first = _load("golden_23a_pool_gate_admit")
+    assert first["response"]["status"] == 200
+    assert first["response"]["body"]["model"] == "stub-simple"
+    assert first["trace_events"][0]["key_id"] == "guard_pool/key-g"
+    second = _load("golden_23b_pool_gate_block")
+    assert second["response"]["status"] == 502
+    err = second["response"]["body"]["error"]
+    assert err["type"] == "upstream_error" and err["status_code"] == 429
+    assert "guard_pool" in err["message"]
+    assert "guard-pool-one-request" in err["message"]
+    assert "cost guard limiter" in err["message"]
+
+
+def test_24_watchdog_injection_contract():
+    """Injected upstream 402 (billing leak) is terminal on the no-fallback
+    complex tier; the watchdog records the signal (pinned in 93)."""
+    d = _load("golden_24a_watchdog_402")
+    assert d["response"]["status"] == 502
+    err = d["response"]["body"]["error"]
+    assert err["type"] == "upstream_error" and err["status_code"] == 402
+    assert "stub payment required" in err["message"]
+    # no-fallback primary failure emits no route trace event (Stage 0
+    # semantics: the cascade path is what gets traced)
+    assert d["trace_events"] == []
+
+
+def test_93_admin_costguard_contract():
+    """Admin snapshot: limiter counters, window loads, pacer, watchdog and
+    reconciliation are deterministic for the pinned scenario order; no
+    principal ids beyond the VK_* labels; no secrets."""
+    d = _load("golden_93_admin_costguard")
+    body = d["response"]["body"]
+    assert d["response"]["status"] == 200
+    assert body["enabled"] is True
+    assert body["estimate_chars_per_token"] == 4.0
+    lms = {lm["name"]: lm for lm in body["limiters"]}
+    assert set(lms) == {"vk-two-requests", "guard-pool-one-request",
+                        "vk-token-budget", "global-requests"}
+    # one block per exercised limiter; the global ceiling never fired
+    assert lms["vk-two-requests"]["blocks"] == 1        # 21d
+    assert lms["guard-pool-one-request"]["blocks"] == 1  # 23b
+    assert lms["vk-token-budget"]["blocks"] == 1         # 22c
+    assert lms["global-requests"]["blocks"] == 0
+    assert lms["vk-two-requests"]["admits"] == 6          # 18c/18d/19b/21b/21c/22b
+    assert lms["guard-pool-one-request"]["admits"] == 4   # one per pool identity
+    assert lms["global-requests"]["admits"] == 24         # every admitted request
+    # principal windows carry ONLY vk labels (admin exempt, ids scrubbed)
+    for name in ("vk-two-requests", "vk-token-budget"):
+        idents = set(lms[name]["identities"])
+        assert idents == {"VK_A", "VK_B", "VK_C", "VK_D", "VK_E"}
+    assert set(lms["guard-pool-one-request"]["identities"]) == {
+        "rotate_pool", "exhaust_pool", "stream_pool", "guard_pool"}
+    assert set(lms["global-requests"]["identities"]) == {"global"}
+    # the reconciliation proof, as a window load: VK_E holds 11 tokens
+    assert lms["vk-token-budget"]["identities"]["VK_E"]["used"] == 11
+    # pacer never engaged (burst 50 >> capture traffic)
+    assert body["pacer"] == {"enabled": True, "requests_per_second": 100.0,
+                             "max_burst": 50, "pace_waits_total": 0,
+                             "last_wait_seconds": 0.0}
+    # watchdog: exactly the injected 402, ts scrubbed
+    wd = body["watchdog"]
+    assert wd["statuses"] == [401, 402]
+    assert wd["events_total"] == 1 and wd["by_status"] == {"402": 1}
+    assert wd["events"] == [{"ts": "[ts]", "status": 402,
+                             "model": "stub-complex", "key_id": None}]
+    assert wd["billing_visibility"] == "ok" and wd["unbilled_completions"] == 0
+    # reconciliation counters for the pinned scenario order
+    rec = body["reconciliation"]
+    assert rec["estimates_total"] == 24
+    assert rec["reconciled_total"] == 21   # completions with usage
+    assert rec["unreconciled_total"] == 3  # 06 no-user + 23b pool block + 24a 402
+    assert rec["drift_tokens_total"] > 0   # estimates are honest, not exact
+    # no secret material on the snapshot
+    raw = json.dumps(body)
+    assert "poolkey" not in raw and "api_key" not in raw

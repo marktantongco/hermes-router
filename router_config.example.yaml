@@ -258,3 +258,53 @@ pricing:
 # A virtual key whose in-window spend is >= its budget gets HTTP 402
 # (budget_exceeded) BEFORE any upstream call. Virtual keys cannot access
 # /admin/* or /metrics (403) — the gateway admin key remains all-powerful.
+
+# ── Stage 5: cost guard ───────────────────────────────────────────────────
+# Admission control between the budget gate and upstream dispatch. An absent
+# section disables the guard entirely (zero behavior change).
+#
+# Limiters are true sliding windows in three scopes:
+#   principal — per virtual key (the admin gateway key is exempt, mirroring
+#               the Stage 4 budget gate)
+#   pool      — per key-pool name, enforced at the pooled dispatch door (a
+#               blocked attempt behaves like pool exhaustion: the cascade
+#               advances with a synthetic 429)
+#   global    — every request, admin included
+# Each limiter sets exactly ONE dimension: `requests` (count) or `tokens`
+# (estimated prompt tokens, reconciled to the upstream-reported total after
+# completion — windows hold exact usage, not estimates). Blocked requests
+# return HTTP 429 cost_guard_rate_limited with the limiter verdict in detail.
+#
+#   pacer    — token-bucket dispatch smoother: max_burst immediate admits,
+#               then requests_per_second steady (keeps free-tier ceilings).
+#   watchdog — records upstream 401/402 billing leaks; the /admin/costguard
+#               report cross-checks completions against ledger appends
+#               (billing_visibility: ok | leaking).
+#
+# Introspect live at GET /admin/costguard (auth required). Invalid
+# configuration refuses startup / hot-reload (fail-closed).
+cost_guard:
+  enabled: true
+  estimate_chars_per_token: 4      # prompt-token estimate: chars / this
+  limiters:
+    - name: per-key-rpm            # example: 30 requests / minute / key
+      scope: principal
+      requests: 30
+      window_seconds: 60
+    - name: per-key-tpm            # example: 60k tokens / minute / key
+      scope: principal
+      tokens: 60000
+      window_seconds: 60
+    - name: groq-free-rpd          # example: a free tier's daily ceiling
+      scope: pool
+      requests: 14400
+      window_seconds: 86400
+    - name: global-rps-safety
+      scope: global
+      requests: 600
+      window_seconds: 60
+  pacer:
+    requests_per_second: 10
+    max_burst: 20
+  watchdog:
+    statuses: [401, 402]

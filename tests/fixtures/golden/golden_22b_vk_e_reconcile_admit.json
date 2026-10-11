@@ -1,0 +1,57 @@
+{
+  "name": "golden_22b_vk_e_reconcile_admit",
+  "description": "VK_E request 1 — est 9 tokens admitted (9/19), reconciled to 11",
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "Authorization": "Bearer vk-[REDACTED]"
+    },
+    "body": {
+      "model": "auto",
+      "messages": [
+        {
+          "role": "user",
+          "content": "/use:simple reconcile token budget"
+        }
+      ],
+      "stream": false
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "id": "chatcmpl-stub-golden",
+      "object": "chat.completion",
+      "created": 1727000000,
+      "model": "stub-simple",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Stub response for golden fixture."
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 5,
+        "completion_tokens": 6,
+        "total_tokens": 11
+      }
+    }
+  },
+  "trace_events": [
+    {
+      "event": "route",
+      "tier": "simple",
+      "model": "stub-simple",
+      "upstream_status": 200,
+      "stream": false,
+      "provider": "openai"
+    }
+  ],
+  "volatile": false,
+  "notes": "stub usage 5+6=11 total; signed correction +2 lands on the principal token window"
+}

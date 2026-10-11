@@ -1,0 +1,43 @@
+{
+  "name": "golden_22c_vk_e_token_block",
+  "description": "VK_E request 2 — blocked on TOKENS: used 11 + est 9 = 20 > 19 (estimate-only 9+9=18 would fit)",
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "Authorization": "Bearer vk-[REDACTED]"
+    },
+    "body": {
+      "model": "auto",
+      "stream": false,
+      "messages": [
+        {
+          "role": "user",
+          "content": "/use:simple reconcile token budget"
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 429,
+    "body": {
+      "error": {
+        "message": "Cost guard limiter exceeded",
+        "type": "cost_guard_rate_limited",
+        "detail": {
+          "limiter": "vk-token-budget",
+          "scope": "principal",
+          "identity": "VK_E",
+          "dimension": "tokens",
+          "limit": 19,
+          "used": 11,
+          "window_seconds": 3600.0,
+          "retry_after_seconds": "[computed]"
+        }
+      }
+    }
+  },
+  "trace_events": [],
+  "volatile": false,
+  "notes": "used=11 is the reconciliation proof: the window holds the actual total, not the estimate"
+}

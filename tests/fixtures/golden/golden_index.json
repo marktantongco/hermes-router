@@ -1,6 +1,6 @@
 {
-  "captured": "2026-10-11T03:05:38Z",
-  "upstream_commit": "4f3c19f8c37b252646afe9cfb7791d5d6637c60c",
+  "captured": "2026-10-11T05:36:41Z",
+  "upstream_commit": "306ca1100cbf2edd78fbae688053242af36fabe5",
   "router_config": {
     "server": {
       "host": "127.0.0.1",
@@ -13,6 +13,46 @@
     "ledger": {
       "enabled": true,
       "db_path": "ledger.sqlite3"
+    },
+    "cost_guard": {
+      "enabled": true,
+      "estimate_chars_per_token": 4,
+      "limiters": [
+        {
+          "name": "vk-two-requests",
+          "scope": "principal",
+          "requests": 2,
+          "window_seconds": 3600
+        },
+        {
+          "name": "guard-pool-one-request",
+          "scope": "pool",
+          "requests": 1,
+          "window_seconds": 3600
+        },
+        {
+          "name": "vk-token-budget",
+          "scope": "principal",
+          "tokens": 19,
+          "window_seconds": 3600
+        },
+        {
+          "name": "global-requests",
+          "scope": "global",
+          "requests": 1000,
+          "window_seconds": 60
+        }
+      ],
+      "pacer": {
+        "requests_per_second": 100,
+        "max_burst": 50
+      },
+      "watchdog": {
+        "statuses": [
+          401,
+          402
+        ]
+      }
     },
     "pricing": {
       "default": {
@@ -106,6 +146,15 @@
             "label": "key-f"
           }
         ]
+      },
+      "guard_pool": {
+        "default_cooldown_seconds": 1,
+        "keys": [
+          {
+            "ref": "GOLDEN_POOL_KEY_G",
+            "label": "key-g"
+          }
+        ]
       }
     },
     "categories": {
@@ -164,6 +213,13 @@
         "base_url": "http://127.0.0.1:9901/v1",
         "key_pool": "stream_pool",
         "timeout_seconds": 20
+      },
+      "pooled_guard": {
+        "label": "Pooled cost-guard tier",
+        "model": "stub-simple",
+        "base_url": "http://127.0.0.1:9901/v1",
+        "key_pool": "guard_pool",
+        "timeout_seconds": 20
       }
     }
   },
@@ -174,6 +230,7 @@
     "Stage 2: trace route events carry provider; scenarios 10-14 exercise adapters",
     "Stage 3: scenarios 15-17 exercise key-pool rotation/exhaustion/streaming; route events carry key_id, key_rotation events carry from_key_id",
     "Stage 4: scenarios 18-20 exercise virtual-key attribution, streaming usage capture, blocking budgets (402) and admin gating (403); random vk ids/tokens/hashes scrubbed to VK_A/VK_B/VK_C labels",
+    "Stage 5: scenarios 21-24 pin the cost guard — principal request/token limiter boundaries (VK_D/VK_E with reconciliation proof), pool-scope gate (guard_pool) and the injected-402 watchdog; snapshot 93 pins the /admin/costguard state (VK_D/VK_E labels, ts scrubbed)",
     "Re-capture at every stage boundary; diff = behavior regression signal"
   ],
   "fixtures": [
@@ -206,7 +263,18 @@
     "golden_19c_budget_block_402",
     "golden_19d_virtual_keys_listing",
     "golden_20_vk_admin_forbidden",
+    "golden_21a_vk_d_create",
+    "golden_21b_vk_d_request_one",
+    "golden_21c_vk_d_request_two",
+    "golden_21d_vk_d_request_block",
+    "golden_22a_vk_e_create",
+    "golden_22b_vk_e_reconcile_admit",
+    "golden_22c_vk_e_token_block",
+    "golden_23a_pool_gate_admit",
+    "golden_23b_pool_gate_block",
+    "golden_24a_watchdog_402",
     "golden_92_admin_pools",
+    "golden_93_admin_costguard",
     "golden_90_health",
     "golden_91_metrics"
   ]

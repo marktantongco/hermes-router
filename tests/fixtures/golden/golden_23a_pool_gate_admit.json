@@ -1,0 +1,58 @@
+{
+  "name": "golden_23a_pool_gate_admit",
+  "description": "guard_pool request 1 — pool window 1/1, served 200 by key-g",
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "Authorization": "Bearer golden-test-key-0001"
+    },
+    "body": {
+      "model": "auto",
+      "messages": [
+        {
+          "role": "user",
+          "content": "/use:pooled_guard pool gate first"
+        }
+      ],
+      "stream": false
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "id": "chatcmpl-stub-golden",
+      "object": "chat.completion",
+      "created": 1727000000,
+      "model": "stub-simple",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Stub response for golden fixture."
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 5,
+        "completion_tokens": 6,
+        "total_tokens": 11
+      }
+    }
+  },
+  "trace_events": [
+    {
+      "event": "route",
+      "tier": "pooled_guard",
+      "model": "stub-simple",
+      "upstream_status": 200,
+      "stream": false,
+      "provider": "openai",
+      "key_id": "guard_pool/key-g"
+    }
+  ],
+  "volatile": false,
+  "notes": "pool-scope limiter admits at the pooled dispatch door; pooled route event carries key_id"
+}

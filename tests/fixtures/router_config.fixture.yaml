@@ -18,6 +18,18 @@
 #   - stub usage is deterministic (5/6 openai, 7/6 anthropic) so costs pin
 #     exactly: stub-complex 5@1.25 + 6@5.0 = 6+30 = 36 micros per request
 #   - budget scenarios rely on stub-simple being free and stub-complex 36u
+#
+# Cost guard notes (Stage 5):
+#   - vk-two-requests (principal, requests, 2): VK_D admitted exactly 2,
+#     3rd request blocked pre-routing
+#   - vk-token-budget (principal, tokens, 19): VK_E's 2nd request fits the
+#     estimate-only sum (9+9=18) but not the reconciled window (11+9=20) —
+#     the block IS the reconciliation proof
+#   - guard-pool-one-request (pool, requests, 1): every pool identity gets
+#     exactly one admit per window; guard_pool's 2nd request blocks at the
+#     dispatch door
+#   - global-requests (1000/60s) never fires in capture; pacer burst 50 >>
+#     capture traffic so pace waits stay 0
 
 server:
   host: 127.0.0.1
@@ -30,6 +42,32 @@ auth:
 ledger:
   enabled: true
   db_path: ledger.sqlite3
+
+cost_guard:
+  enabled: true
+  estimate_chars_per_token: 4
+  limiters:
+    - name: vk-two-requests
+      scope: principal
+      requests: 2
+      window_seconds: 3600
+    - name: guard-pool-one-request
+      scope: pool
+      requests: 1
+      window_seconds: 3600
+    - name: vk-token-budget
+      scope: principal
+      tokens: 19
+      window_seconds: 3600
+    - name: global-requests
+      scope: global
+      requests: 1000
+      window_seconds: 60
+  pacer:
+    requests_per_second: 100
+    max_burst: 50
+  watchdog:
+    statuses: [401, 402]
 
 pricing:
   default:
@@ -92,6 +130,11 @@ key_pools:
         label: key-e
       - ref: GOLDEN_POOL_KEY_F
         label: key-f
+  guard_pool:
+    default_cooldown_seconds: 1
+    keys:
+      - ref: GOLDEN_POOL_KEY_G
+        label: key-g
 
 categories:
   simple:
@@ -141,4 +184,10 @@ categories:
     model: stub-simple
     base_url: http://127.0.0.1:9901/v1
     key_pool: stream_pool
+    timeout_seconds: 20
+  pooled_guard:
+    label: Pooled cost-guard tier
+    model: stub-simple
+    base_url: http://127.0.0.1:9901/v1
+    key_pool: guard_pool
     timeout_seconds: 20

@@ -20,6 +20,12 @@ text / streaming / cross-protocol fallback / tool-call paths plus the
 /admin/providers registry snapshot. HERMES_ROUTER_FIXED_EPOCH pins the
 timestamps the adapter synthesizes.
 
+Stage 5: the stub injects a deterministic billing-leak (402) on
+"billing-leak" prompts in both protocols, and scenarios 21-24 pin the cost
+guard — principal request/token limiter boundaries (VK_D/VK_E), pool-scope
+ceilings (guard_pool) and the watchdog — plus the /admin/costguard
+snapshot (93).
+
 Usage:  python3 tools/capture_golden.py
 """
 from __future__ import annotations
@@ -65,6 +71,7 @@ POOL_KEY_C = "poolkey-cccc"   # exhaust_pool key-c: always 429
 POOL_KEY_D = "poolkey-dddd"   # exhaust_pool key-d: always 429
 POOL_KEY_E = "poolkey-eeee"   # stream_pool key-e: always 429
 POOL_KEY_F = "poolkey-ffff"   # stream_pool key-f: healthy
+POOL_KEY_G = "poolkey-gggg"   # guard_pool key-g: healthy (Stage 5)
 POOL_429_KEYS = {POOL_KEY_A, POOL_KEY_C, POOL_KEY_D, POOL_KEY_E}
 
 RUNTIME_FILES = [
@@ -75,6 +82,7 @@ RUNTIME_FILES = [
     "keypool.py",
     "catalog.py",
     "ledger.py",
+    "costguard.py",
     "surrogate_models.py",
     "zero_shot_classifier.py",
     "fasttext_classifier.py",
@@ -167,6 +175,15 @@ def build_stub_app() -> FastAPI:
                 status_code=500,
             )
 
+        # Stage 5: deterministic billing-leak trigger for the watchdog
+        # scenario (upstream payment wall — a billing signal nobody owns)
+        if "billing-leak" in last_user:
+            return JSONResponse(
+                {"error": {"message": "stub payment required",
+                           "type": "payment_required_error"}},
+                status_code=402,
+            )
+
         if payload.get("stream"):
             def gen():
                 for i in range(3):
@@ -201,6 +218,15 @@ def build_stub_app() -> FastAPI:
                 {"type": "error",
                  "error": {"type": "api_error", "message": "stub anthropic failure"}},
                 status_code=500,
+            )
+
+        # Stage 5: deterministic billing-leak trigger (anthropic shape)
+        if "billing-leak" in text:
+            return JSONResponse(
+                {"type": "error",
+                 "error": {"type": "permission_error",
+                           "message": "stub anthropic payment required"}},
+                status_code=402,
             )
 
         # Tool-use round trip: anthropic tool_use block -> OpenAI tool_calls
@@ -602,6 +628,118 @@ def run_scenarios(client: httpx.Client, trace_path: Path) -> list[dict]:
                  "/metrics reject them with 403",
            request_headers={"Authorization": "Bearer vk-[REDACTED]"})
 
+    # ── Stage 5: cost guard — limiter boundaries, reconciliation, watchdog ─
+    # Boundary values are chosen so the pinned behavior PROVES each
+    # mechanism (arithmetic in docs/STAGE5_COSTGUARD.md):
+    #   * vk-two-requests (principal, requests, 2): VK_D 3rd request blocks
+    #   * vk-token-budget (principal, tokens, 19): VK_E 2nd request blocks
+    #     ONLY because the estimate was reconciled to actual (est-only
+    #     sum 9+9=18 fits; reconciled 11+9=20 does not)
+    #   * guard-pool-one-request (pool, requests, 1): guard_pool 2nd request
+    #     blocks at the pooled dispatch door (synthetic 429)
+
+    def scrub_cg(obj: Any, mapping: dict[str, str]) -> Any:
+        """Cost-guard fixture scrub: vk ids (keys AND values), ts,
+        timing-derived retry_after."""
+        if isinstance(obj, dict):
+            out: dict[str, Any] = {}
+            for k, v in obj.items():
+                if k == "ts":
+                    out[k] = "[ts]"
+                elif k == "retry_after_seconds":
+                    out[k] = "[computed]"
+                else:
+                    out[mapping.get(k, k)] = scrub_cg(v, mapping)
+            return out
+        if isinstance(obj, list):
+            return [scrub_cg(x, mapping) for x in obj]
+        if isinstance(obj, str):
+            return mapping.get(obj, obj)
+        return obj
+
+    # 21 — principal-scope request limiter boundary (VK_D)
+    vk_d = create_vk("21a_vk_d_create", {"name": "subscriber-d"}, "VK_D", VK_MAP)
+    post_chat("golden_21b_vk_d_request_one",
+              "VK_D request 1/2 — admitted (requests window 1/2), stub-simple 200",
+              [user_msg("/use:simple guard request one")],
+              auth_header=f"Bearer {vk_d['key']}",
+              record_auth_header="Bearer vk-[REDACTED]",
+              notes="principal-scope requests limiter: used 0+1 <= 2")
+    post_chat("golden_21c_vk_d_request_two",
+              "VK_D request 2/2 — admitted at the exact boundary (2/2), 200",
+              [user_msg("/use:simple guard request two")],
+              auth_header=f"Bearer {vk_d['key']}",
+              record_auth_header="Bearer vk-[REDACTED]",
+              notes="boundary admit: used 1+1 == limit 2; token window also at "
+                    "its boundary (8 est + 3 corr + 8 est = 19/19)")
+    r = client.post(f"{ROUTER_URL}/v1/chat/completions",
+                    json={"model": "auto", "stream": False,
+                          "messages": [user_msg("/use:simple guard request three")]},
+                    headers={"Authorization": f"Bearer {vk_d['key']}"})
+    record("golden_21d_vk_d_request_block",
+           "VK_D request 3 — blocked 429 BEFORE routing (requests 2/2 used)",
+           {"model": "auto", "stream": False,
+            "messages": [user_msg("/use:simple guard request three")]},
+           "/v1/chat/completions", "POST", r.status_code,
+           scrub_cg(r.json(), VK_MAP), None,
+           notes="cost_guard_rate_limited; detail pins limiter/scope/dimension/"
+                 "limit/used; retry_after is timing-derived (scrubbed); no "
+                 "trace events — the request never routed",
+           request_headers={"Authorization": "Bearer vk-[REDACTED]"})
+
+    # 22 — estimate-to-actual reconciliation boundary (VK_E)
+    vk_e = create_vk("22a_vk_e_create", {"name": "subscriber-e"}, "VK_E", VK_MAP)
+    post_chat("golden_22b_vk_e_reconcile_admit",
+              "VK_E request 1 — est 9 tokens admitted (9/19), reconciled to 11",
+              [user_msg("/use:simple reconcile token budget")],
+              auth_header=f"Bearer {vk_e['key']}",
+              record_auth_header="Bearer vk-[REDACTED]",
+              notes="stub usage 5+6=11 total; signed correction +2 lands on "
+                    "the principal token window")
+    r = client.post(f"{ROUTER_URL}/v1/chat/completions",
+                    json={"model": "auto", "stream": False,
+                          "messages": [user_msg("/use:simple reconcile token budget")]},
+                    headers={"Authorization": f"Bearer {vk_e['key']}"})
+    record("golden_22c_vk_e_token_block",
+           "VK_E request 2 — blocked on TOKENS: used 11 + est 9 = 20 > 19 "
+           "(estimate-only 9+9=18 would fit)",
+           {"model": "auto", "stream": False,
+            "messages": [user_msg("/use:simple reconcile token budget")]},
+           "/v1/chat/completions", "POST", r.status_code,
+           scrub_cg(r.json(), VK_MAP), None,
+           notes="used=11 is the reconciliation proof: the window holds the "
+                 "actual total, not the estimate",
+           request_headers={"Authorization": "Bearer vk-[REDACTED]"})
+
+    # 23 — pool-scope ceiling at the pooled dispatch door (guard_pool)
+    post_chat("golden_23a_pool_gate_admit",
+              "guard_pool request 1 — pool window 1/1, served 200 by key-g",
+              [user_msg("/use:pooled_guard pool gate first")],
+              notes="pool-scope limiter admits at the pooled dispatch door; "
+                    "pooled route event carries key_id")
+    r = client.post(f"{ROUTER_URL}/v1/chat/completions",
+                    json={"model": "auto", "stream": False,
+                          "messages": [user_msg("/use:pooled_guard pool gate second")]},
+                    headers={"Authorization": AUTH_HEADER})
+    record("golden_23b_pool_gate_block",
+           "guard_pool request 2 — synthetic 429 at the dispatch door; no "
+           "fallback tier -> 502 upstream_error envelope",
+           {"model": "auto", "stream": False,
+            "messages": [user_msg("/use:pooled_guard pool gate second")]},
+           "/v1/chat/completions", "POST", r.status_code,
+           r.json(), None,
+           notes="pool-exhaustion semantics (Stage 3 contract) extended to "
+                 "limiter blocks; envelope names the cost guard limiter",
+           request_headers={"Authorization": "Bearer [set]"})
+
+    # 24 — billing-leak watchdog: injected upstream 402
+    post_chat("golden_24a_watchdog_402",
+              "upstream 402 (stub payment trigger) — terminal on complex (no "
+              "fallback) -> 502 envelope; watchdog records the signal",
+              [user_msg("/use:complex trigger billing-leak")],
+              notes="single-key lane observes the final 402; admission ticket "
+                    "abandoned (unreconciled); /admin/costguard pins the event")
+
     # 92 — Stage 3: pool state snapshot (deterministic fields only)
     r = client.get(f"{ROUTER_URL}/admin/pools", headers={"Authorization": AUTH_HEADER})
     pools_out = []
@@ -619,11 +757,25 @@ def run_scenarios(client: httpx.Client, trace_path: Path) -> list[dict]:
             ],
         })
     record("golden_92_admin_pools",
-           "GET /admin/pools — per-key counters after scenarios 15-17 (cooldowns excluded)",
+           "GET /admin/pools — per-key counters after the pool scenarios "
+           "(15-17 rotation/exhaustion/stream + 23 guard_pool)",
            None, "/admin/pools", "GET", r.status_code,
            {"pools": pools_out, "count": len(pools_out)}, None,
            notes="Counters are cumulative and deterministic for this scenario order; "
                  "cooldown/availability fields are volatile and omitted",
+           volatile=True,
+           request_headers={"Authorization": "Bearer [set]"})
+
+    # 93 — Stage 5: cost guard snapshot (config + counters + window loads)
+    r = client.get(f"{ROUTER_URL}/admin/costguard", headers={"Authorization": AUTH_HEADER})
+    record("golden_93_admin_costguard",
+           "GET /admin/costguard — limiters, in-window loads, pacer, watchdog, "
+           "reconciliation, billing-visibility cross-check",
+           None, "/admin/costguard", "GET", r.status_code,
+           scrub_cg(r.json(), VK_MAP), None,
+           notes="vk ids mapped to VK_* labels; watchdog event ts scrubbed; "
+                 "counters deterministic for this scenario order; pacer "
+                 "burst 50 >> capture traffic so pace_waits stays 0",
            volatile=True,
            request_headers={"Authorization": "Bearer [set]"})
 
@@ -693,7 +845,8 @@ def main() -> None:
            "GOLDEN_ROUTER_KEY": GOLDEN_ROUTER_KEY,
            "GOLDEN_POOL_KEY_A": POOL_KEY_A, "GOLDEN_POOL_KEY_B": POOL_KEY_B,
            "GOLDEN_POOL_KEY_C": POOL_KEY_C, "GOLDEN_POOL_KEY_D": POOL_KEY_D,
-           "GOLDEN_POOL_KEY_E": POOL_KEY_E, "GOLDEN_POOL_KEY_F": POOL_KEY_F}
+           "GOLDEN_POOL_KEY_E": POOL_KEY_E, "GOLDEN_POOL_KEY_F": POOL_KEY_F,
+           "GOLDEN_POOL_KEY_G": POOL_KEY_G}
     env.update({k: v for k, v in __import__("os").environ.items()
                 if k.startswith(("LC_", "LANG_"))})
     router_log = open(tmp / "router.stderr.log", "w")
@@ -725,6 +878,10 @@ def main() -> None:
                 "Stage 4: scenarios 18-20 exercise virtual-key attribution, streaming "
                 "usage capture, blocking budgets (402) and admin gating (403); "
                 "random vk ids/tokens/hashes scrubbed to VK_A/VK_B/VK_C labels",
+                "Stage 5: scenarios 21-24 pin the cost guard — principal request/token "
+                "limiter boundaries (VK_D/VK_E with reconciliation proof), pool-scope "
+                "gate (guard_pool) and the injected-402 watchdog; snapshot 93 pins "
+                "the /admin/costguard state (VK_D/VK_E labels, ts scrubbed)",
                 "Re-capture at every stage boundary; diff = behavior regression signal",
             ],
             "fixtures": [f["name"] for f in fixtures],
