@@ -1,0 +1,57 @@
+{
+  "name": "golden_18c_vk_a_nonstream",
+  "description": "chat as virtual key A — attributed, free-tier model costs 0",
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "Authorization": "Bearer vk-[REDACTED]"
+    },
+    "body": {
+      "model": "auto",
+      "messages": [
+        {
+          "role": "user",
+          "content": "/use:simple vk attribution a"
+        }
+      ],
+      "stream": false
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "id": "chatcmpl-stub-golden",
+      "object": "chat.completion",
+      "created": 1727000000,
+      "model": "stub-simple",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Stub response for golden fixture."
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 5,
+        "completion_tokens": 6,
+        "total_tokens": 11
+      }
+    }
+  },
+  "trace_events": [
+    {
+      "event": "route",
+      "tier": "simple",
+      "model": "stub-simple",
+      "upstream_status": 200,
+      "stream": false,
+      "provider": "openai"
+    }
+  ],
+  "volatile": false,
+  "notes": "Ledger record 18e shows virtual_key_id=VK_A, cost 0 (free)"
+}

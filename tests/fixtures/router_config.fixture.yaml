@@ -13,6 +13,11 @@
 #   - three disjoint pools so each pool scenario starts at a fresh RR pointer
 #   - the stub rate-limits poolkey-aaaa/cccc/dddd/eeee with retry-after: 1
 #   - require_capabilities [fast] exercises the capability filter path
+#
+# Billing notes (Stage 4):
+#   - stub usage is deterministic (5/6 openai, 7/6 anthropic) so costs pin
+#     exactly: stub-complex 5@1.25 + 6@5.0 = 6+30 = 36 micros per request
+#   - budget scenarios rely on stub-simple being free and stub-complex 36u
 
 server:
   host: 127.0.0.1
@@ -21,6 +26,30 @@ server:
 auth:
   mode: required
   api_key_env: GOLDEN_ROUTER_KEY
+
+ledger:
+  enabled: true
+  db_path: ledger.sqlite3
+
+pricing:
+  default:
+    input_per_mtok: 0.5
+    output_per_mtok: 1.5
+  entries:
+    stub-simple:
+      input_per_mtok: 0.0
+      output_per_mtok: 0.0
+      free: true
+    stub-complex:
+      input_per_mtok: 1.25
+      output_per_mtok: 5.0
+    stub-fallback:
+      input_per_mtok: 0.0
+      output_per_mtok: 0.0
+      free: true
+    stub-anthropic:
+      input_per_mtok: 0.3
+      output_per_mtok: 2.0
 
 classifier:
   model: stub-classifier

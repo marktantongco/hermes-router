@@ -1,0 +1,26 @@
+{
+  "name": "golden_20_vk_admin_forbidden",
+  "description": "GET /admin/ledger/records as a virtual key — 403 admin_only",
+  "request": {
+    "method": "GET",
+    "path": "/admin/ledger/records",
+    "headers": {
+      "Authorization": "Bearer vk-[REDACTED]"
+    },
+    "body": null
+  },
+  "response": {
+    "status": 403,
+    "body": {
+      "detail": {
+        "error": {
+          "message": "Virtual keys cannot access admin surfaces",
+          "type": "admin_only"
+        }
+      }
+    }
+  },
+  "trace_events": [],
+  "volatile": false,
+  "notes": "Virtual keys are inference-only: every /admin surface and /metrics reject them with 403"
+}

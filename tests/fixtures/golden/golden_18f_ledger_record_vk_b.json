@@ -1,0 +1,50 @@
+{
+  "name": "golden_18f_ledger_record_vk_b",
+  "description": "GET /admin/ledger/records?virtual_key_id=B — stream attribution",
+  "request": {
+    "method": "GET",
+    "path": "/admin/ledger/records",
+    "headers": {
+      "Authorization": "Bearer [set]"
+    },
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "records": [
+        {
+          "seq": 16,
+          "ts": "[ts]",
+          "record_type": "usage",
+          "status": "ok",
+          "session_key": "f8ab678b21934a5f",
+          "tier": "complex",
+          "model": "stub-complex",
+          "provider": "openai",
+          "key_id": "no_key",
+          "virtual_key_id": "VK_B",
+          "fallback_level": 0,
+          "stream": 1,
+          "prompt_tokens": 5,
+          "completion_tokens": 6,
+          "total_tokens": 11,
+          "cost_input_micros": 6,
+          "cost_output_micros": 30,
+          "cost_total_micros": 36,
+          "price_input_nano": 1250000000,
+          "price_output_nano": 5000000000,
+          "price_source": "model",
+          "price_snapshot_id": "8d65b5f420891854",
+          "prev_hash": "[hash]",
+          "row_hash": "[hash]"
+        }
+      ],
+      "count": 1,
+      "total": 16
+    }
+  },
+  "trace_events": [],
+  "volatile": true,
+  "notes": "stream=1, usage sniffed 5/6, cost_total_micros=36, price_source=model"
+}

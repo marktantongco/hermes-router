@@ -1,0 +1,33 @@
+{
+  "name": "golden_19a_vk_c_create",
+  "description": "POST /admin/virtual_keys — create VK_C (cost_micros)",
+  "request": {
+    "method": "POST",
+    "path": "/admin/virtual_keys",
+    "headers": {
+      "Authorization": "Bearer [set]"
+    },
+    "body": {
+      "name": "subscriber-c",
+      "budget_mode": "cost_micros",
+      "budget_limit": 36,
+      "budget_period": "total"
+    }
+  },
+  "response": {
+    "status": 201,
+    "body": {
+      "id": "VK_C",
+      "name": "subscriber-c",
+      "created_at": "[ts]",
+      "enabled": 1,
+      "budget_mode": "cost_micros",
+      "budget_limit": 36,
+      "budget_period": "total",
+      "key": "vk-[REDACTED]"
+    }
+  },
+  "trace_events": [],
+  "volatile": false,
+  "notes": "Plaintext token shown once (redacted here); only its SHA-256 is stored server-side"
+}

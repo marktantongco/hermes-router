@@ -1,6 +1,6 @@
 {
-  "captured": "2026-10-11T02:56:28Z",
-  "upstream_commit": "b1a64c6bf1de12a26583136cc1d36bad9b255847",
+  "captured": "2026-10-11T03:05:38Z",
+  "upstream_commit": "4f3c19f8c37b252646afe9cfb7791d5d6637c60c",
   "router_config": {
     "server": {
       "host": "127.0.0.1",
@@ -9,6 +9,36 @@
     "auth": {
       "mode": "required",
       "api_key_env": "GOLDEN_ROUTER_KEY"
+    },
+    "ledger": {
+      "enabled": true,
+      "db_path": "ledger.sqlite3"
+    },
+    "pricing": {
+      "default": {
+        "input_per_mtok": 0.5,
+        "output_per_mtok": 1.5
+      },
+      "entries": {
+        "stub-simple": {
+          "input_per_mtok": 0.0,
+          "output_per_mtok": 0.0,
+          "free": true
+        },
+        "stub-complex": {
+          "input_per_mtok": 1.25,
+          "output_per_mtok": 5.0
+        },
+        "stub-fallback": {
+          "input_per_mtok": 0.0,
+          "output_per_mtok": 0.0,
+          "free": true
+        },
+        "stub-anthropic": {
+          "input_per_mtok": 0.3,
+          "output_per_mtok": 2.0
+        }
+      }
     },
     "classifier": {
       "model": "stub-classifier",
@@ -143,6 +173,7 @@
     "Volatile fields normalized; see 'volatile' flag per fixture",
     "Stage 2: trace route events carry provider; scenarios 10-14 exercise adapters",
     "Stage 3: scenarios 15-17 exercise key-pool rotation/exhaustion/streaming; route events carry key_id, key_rotation events carry from_key_id",
+    "Stage 4: scenarios 18-20 exercise virtual-key attribution, streaming usage capture, blocking budgets (402) and admin gating (403); random vk ids/tokens/hashes scrubbed to VK_A/VK_B/VK_C labels",
     "Re-capture at every stage boundary; diff = behavior regression signal"
   ],
   "fixtures": [
@@ -164,6 +195,17 @@
     "golden_15_pool_rotation",
     "golden_16_pool_exhausted",
     "golden_17_pool_stream_rotation",
+    "golden_18a_vk_a_create",
+    "golden_18b_vk_b_create",
+    "golden_18c_vk_a_nonstream",
+    "golden_18d_vk_b_stream",
+    "golden_18e_ledger_record_vk_a",
+    "golden_18f_ledger_record_vk_b",
+    "golden_19a_vk_c_create",
+    "golden_19b_budget_last_allowed",
+    "golden_19c_budget_block_402",
+    "golden_19d_virtual_keys_listing",
+    "golden_20_vk_admin_forbidden",
     "golden_92_admin_pools",
     "golden_90_health",
     "golden_91_metrics"

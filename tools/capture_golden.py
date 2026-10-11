@@ -33,6 +33,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import httpx
 import uvicorn
@@ -73,6 +74,7 @@ RUNTIME_FILES = [
     "keystore.py",
     "keypool.py",
     "catalog.py",
+    "ledger.py",
     "surrogate_models.py",
     "zero_shot_classifier.py",
     "fasttext_classifier.py",
@@ -92,6 +94,24 @@ def _sse_chunk(idx: int, model: str) -> str:
         "created": FIXED_CREATED,
         "model": model,
         "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+    }
+    return f"data: {json.dumps(payload, separators=(',', ':'))}"
+
+
+def _sse_usage_chunk(model: str) -> str:
+    """Final pre-[DONE] usage chunk (Stage 4: feeds the ledger sniffer).
+
+    Mirrors OpenAI's stream_options.include_usage frame shape (empty
+    choices + usage). Emitted unconditionally so streaming usage capture
+    is pinned deterministically.
+    """
+    payload = {
+        "id": "chatcmpl-stub-golden",
+        "object": "chat.completion.chunk",
+        "created": FIXED_CREATED,
+        "model": model,
+        "choices": [],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11},
     }
     return f"data: {json.dumps(payload, separators=(',', ':'))}"
 
@@ -151,6 +171,7 @@ def build_stub_app() -> FastAPI:
             def gen():
                 for i in range(3):
                     yield _sse_chunk(i, model) + "\n\n"
+                yield _sse_usage_chunk(model) + "\n\n"
                 yield "data: [DONE]\n\n"
             return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -318,7 +339,8 @@ def run_scenarios(client: httpx.Client, trace_path: Path) -> list[dict]:
 
     def post_chat(name: str, description: str, messages: list[dict],
                   stream: bool = False, notes: str = "",
-                  auth_header: str | None = AUTH_HEADER) -> None:
+                  auth_header: str | None = AUTH_HEADER,
+                  record_auth_header: str | None = None) -> None:
         body = {"model": "auto", "messages": messages, "stream": stream}
         key = session_key(
             messages[0]["content"] if isinstance(messages[0]["content"], str)
@@ -326,6 +348,8 @@ def run_scenarios(client: httpx.Client, trace_path: Path) -> list[dict]:
         )
         offset = len(trace_lines())  # events before this request
         hdrs = {"Authorization": auth_header} if auth_header else {}
+        rec_hdrs = ({"Authorization": record_auth_header}
+                    if record_auth_header else hdrs)
         if stream:
             chunks: list[str] = []
             status = 0
@@ -336,12 +360,12 @@ def run_scenarios(client: httpx.Client, trace_path: Path) -> list[dict]:
                         chunks.append(line)
             record(name, description, body, "/v1/chat/completions", "POST",
                    status, chunks, key, notes or "SSE transcript, in order",
-                   trace_offset=offset, request_headers=hdrs)
+                   trace_offset=offset, request_headers=rec_hdrs)
         else:
             r = client.post(f"{ROUTER_URL}/v1/chat/completions", json=body, headers=hdrs)
             record(name, description, body, "/v1/chat/completions", "POST",
                    r.status_code, r.json(), key, notes, trace_offset=offset,
-                   request_headers=hdrs)
+                   request_headers=rec_hdrs)
 
     # 01 — override to simple tier, non-streaming
     post_chat("golden_01_simple_nonstream",
@@ -453,6 +477,130 @@ def run_scenarios(client: httpx.Client, trace_path: Path) -> list[dict]:
               "streaming through a pool: 429 on first key, SSE passthrough via second",
               [user_msg("/use:pooled_stream pooled stream please")], stream=True,
               notes="pool_429_cooldown_stream rotation then normal SSE synthesis")
+
+    # ── Stage 4: billing plane — virtual keys, attribution, budgets ──────
+    # Random per-capture material (vk ids/tokens, timestamps, chain hashes)
+    # is scrubbed to stable labels so the fixtures pin the CONTRACT.
+
+    def scrub_vk(obj: Any, mapping: dict[str, str]) -> Any:
+        """Replace random vk ids and redact tokens/hashes recursively."""
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                if k == "key":
+                    out[k] = "vk-[REDACTED]"
+                elif k == "created_at" or k == "ts":
+                    out[k] = "[ts]"
+                elif k in ("virtual_key_id", "id") and isinstance(v, str) \
+                        and v in mapping:
+                    out[k] = mapping[v]
+                elif k in ("row_hash", "prev_hash"):
+                    out[k] = "[hash]"
+                else:
+                    out[k] = scrub_vk(v, mapping)
+            return out
+        if isinstance(obj, list):
+            return [scrub_vk(x, mapping) for x in obj]
+        if isinstance(obj, str) and obj in mapping:
+            return mapping[obj]
+        return obj
+
+    def create_vk(name: str, body: dict, label: str, mapping: dict) -> dict:
+        r = client.post(f"{ROUTER_URL}/admin/virtual_keys", json=body,
+                        headers={"Authorization": AUTH_HEADER})
+        vk = r.json()
+        mapping[vk["id"]] = label
+        record(f"golden_{name}",
+               f"POST /admin/virtual_keys — create {label} ({body.get('budget_mode', 'none')})",
+               body, "/admin/virtual_keys", "POST", r.status_code,
+               scrub_vk(vk, mapping), None,
+               notes="Plaintext token shown once (redacted here); only its "
+                     "SHA-256 is stored server-side",
+               request_headers={"Authorization": "Bearer [set]"})
+        return vk
+
+    # 18 — attribution end-to-end with two virtual keys (exit gate)
+    VK_MAP: dict[str, str] = {}
+    vk_a = create_vk("18a_vk_a_create", {"name": "subscriber-a"}, "VK_A", VK_MAP)
+    vk_b = create_vk("18b_vk_b_create", {"name": "subscriber-b"}, "VK_B", VK_MAP)
+    post_chat("golden_18c_vk_a_nonstream",
+              "chat as virtual key A — attributed, free-tier model costs 0",
+              [user_msg("/use:simple vk attribution a")],
+              auth_header=f"Bearer {vk_a['key']}",
+              record_auth_header="Bearer vk-[REDACTED]",
+              notes="Ledger record 18e shows virtual_key_id=VK_A, cost 0 (free)")
+    post_chat("golden_18d_vk_b_stream",
+              "chat as virtual key B — streamed, usage sniffed from SSE, priced",
+              [user_msg("/use:complex vk attribution b stream")], stream=True,
+              auth_header=f"Bearer {vk_b['key']}",
+              record_auth_header="Bearer vk-[REDACTED]",
+              notes="stub-complex 5@1.25 + 6@5.0 = 6+30 = 36 micros; "
+                    "usage captured from the include_usage chunk")
+    r = client.get(f"{ROUTER_URL}/admin/ledger/records?virtual_key_id={vk_a['id']}",
+                   headers={"Authorization": AUTH_HEADER})
+    record("golden_18e_ledger_record_vk_a",
+           "GET /admin/ledger/records?virtual_key_id=A — attribution contract",
+           None, "/admin/ledger/records", "GET", r.status_code,
+           scrub_vk(r.json(), VK_MAP), None,
+           notes="virtual_key_id pinned to VK_A; ts/row_hash/prev_hash scrubbed; "
+                 "admin-key traffic (scenarios 01-17) has virtual_key_id null",
+           volatile=True,
+           request_headers={"Authorization": "Bearer [set]"})
+    r = client.get(f"{ROUTER_URL}/admin/ledger/records?virtual_key_id={vk_b['id']}",
+                   headers={"Authorization": AUTH_HEADER})
+    record("golden_18f_ledger_record_vk_b",
+           "GET /admin/ledger/records?virtual_key_id=B — stream attribution",
+           None, "/admin/ledger/records", "GET", r.status_code,
+           scrub_vk(r.json(), VK_MAP), None,
+           notes="stream=1, usage sniffed 5/6, cost_total_micros=36, price_source=model",
+           volatile=True,
+           request_headers={"Authorization": "Bearer [set]"})
+
+    # 19 — blocking budget: VK_C allowed exactly one 36-micros complex request
+    vk_c = create_vk("19a_vk_c_create",
+                     {"name": "subscriber-c", "budget_mode": "cost_micros",
+                      "budget_limit": 36, "budget_period": "total"},
+                     "VK_C", VK_MAP)
+    post_chat("golden_19b_budget_last_allowed",
+              "VK_C first /use:complex request passes and spends exactly 36 micros",
+              [user_msg("/use:complex budget check one")],
+              auth_header=f"Bearer {vk_c['key']}",
+              record_auth_header="Bearer vk-[REDACTED]",
+              notes="spent (36) == limit (36) blocks the NEXT request")
+    r = client.post(f"{ROUTER_URL}/v1/chat/completions",
+                    json={"model": "auto", "stream": False,
+                          "messages": [user_msg("/use:complex budget check two")]},
+                    headers={"Authorization": f"Bearer {vk_c['key']}"})
+    record("golden_19c_budget_block_402",
+           "VK_C second request — blocked 402 BEFORE any upstream call",
+           {"model": "auto", "stream": False,
+            "messages": [user_msg("/use:complex budget check two")]},
+           "/v1/chat/completions", "POST", r.status_code,
+           scrub_vk(r.json(), VK_MAP), None,
+           notes="HTTP 402 budget_exceeded; gate runs pre-routing, so the "
+                 "stub upstream is never contacted",
+           request_headers={"Authorization": "Bearer vk-[REDACTED]"})
+    r = client.get(f"{ROUTER_URL}/admin/virtual_keys",
+                   headers={"Authorization": AUTH_HEADER})
+    record("golden_19d_virtual_keys_listing",
+           "GET /admin/virtual_keys — spend rollup per key in its window",
+           None, "/admin/virtual_keys", "GET", r.status_code,
+           scrub_vk(r.json(), VK_MAP), None,
+           notes="VK_C spent: 1 request, 36 micros; budget_mode none keys "
+                 "report no spent block; created_at scrubbed",
+           volatile=True,
+           request_headers={"Authorization": "Bearer [set]"})
+
+    # 20 — virtual keys are forbidden on admin surfaces
+    r = client.get(f"{ROUTER_URL}/admin/ledger/records",
+                   headers={"Authorization": f"Bearer {vk_c['key']}"})
+    record("golden_20_vk_admin_forbidden",
+           "GET /admin/ledger/records as a virtual key — 403 admin_only",
+           None, "/admin/ledger/records", "GET", r.status_code,
+           r.json(), None,
+           notes="Virtual keys are inference-only: every /admin surface and "
+                 "/metrics reject them with 403",
+           request_headers={"Authorization": "Bearer vk-[REDACTED]"})
 
     # 92 — Stage 3: pool state snapshot (deterministic fields only)
     r = client.get(f"{ROUTER_URL}/admin/pools", headers={"Authorization": AUTH_HEADER})
@@ -574,6 +722,9 @@ def main() -> None:
                 "Stage 2: trace route events carry provider; scenarios 10-14 exercise adapters",
                 "Stage 3: scenarios 15-17 exercise key-pool rotation/exhaustion/streaming; "
                 "route events carry key_id, key_rotation events carry from_key_id",
+                "Stage 4: scenarios 18-20 exercise virtual-key attribution, streaming "
+                "usage capture, blocking budgets (402) and admin gating (403); "
+                "random vk ids/tokens/hashes scrubbed to VK_A/VK_B/VK_C labels",
                 "Re-capture at every stage boundary; diff = behavior regression signal",
             ],
             "fixtures": [f["name"] for f in fixtures],

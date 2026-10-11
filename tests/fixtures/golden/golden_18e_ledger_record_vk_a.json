@@ -1,0 +1,50 @@
+{
+  "name": "golden_18e_ledger_record_vk_a",
+  "description": "GET /admin/ledger/records?virtual_key_id=A — attribution contract",
+  "request": {
+    "method": "GET",
+    "path": "/admin/ledger/records",
+    "headers": {
+      "Authorization": "Bearer [set]"
+    },
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "records": [
+        {
+          "seq": 15,
+          "ts": "[ts]",
+          "record_type": "usage",
+          "status": "ok",
+          "session_key": "8226a2609c96e1fa",
+          "tier": "simple",
+          "model": "stub-simple",
+          "provider": "openai",
+          "key_id": null,
+          "virtual_key_id": "VK_A",
+          "fallback_level": 0,
+          "stream": 0,
+          "prompt_tokens": 5,
+          "completion_tokens": 6,
+          "total_tokens": 11,
+          "cost_input_micros": 0,
+          "cost_output_micros": 0,
+          "cost_total_micros": 0,
+          "price_input_nano": 0,
+          "price_output_nano": 0,
+          "price_source": "free",
+          "price_snapshot_id": "8d65b5f420891854",
+          "prev_hash": "[hash]",
+          "row_hash": "[hash]"
+        }
+      ],
+      "count": 1,
+      "total": 16
+    }
+  },
+  "trace_events": [],
+  "volatile": true,
+  "notes": "virtual_key_id pinned to VK_A; ts/row_hash/prev_hash scrubbed; admin-key traffic (scenarios 01-17) has virtual_key_id null"
+}

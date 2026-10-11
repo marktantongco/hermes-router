@@ -1,0 +1,55 @@
+{
+  "name": "golden_19d_virtual_keys_listing",
+  "description": "GET /admin/virtual_keys — spend rollup per key in its window",
+  "request": {
+    "method": "GET",
+    "path": "/admin/virtual_keys",
+    "headers": {
+      "Authorization": "Bearer [set]"
+    },
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "virtual_keys": [
+        {
+          "id": "VK_A",
+          "name": "subscriber-a",
+          "created_at": "[ts]",
+          "enabled": 1,
+          "budget_mode": "none",
+          "budget_limit": 0,
+          "budget_period": "total"
+        },
+        {
+          "id": "VK_B",
+          "name": "subscriber-b",
+          "created_at": "[ts]",
+          "enabled": 1,
+          "budget_mode": "none",
+          "budget_limit": 0,
+          "budget_period": "total"
+        },
+        {
+          "id": "VK_C",
+          "name": "subscriber-c",
+          "created_at": "[ts]",
+          "enabled": 1,
+          "budget_mode": "cost_micros",
+          "budget_limit": 36,
+          "budget_period": "total",
+          "spent": {
+            "requests": 1,
+            "total_tokens": 11,
+            "cost_total_micros": 36
+          }
+        }
+      ],
+      "count": 3
+    }
+  },
+  "trace_events": [],
+  "volatile": true,
+  "notes": "VK_C spent: 1 request, 36 micros; budget_mode none keys report no spent block; created_at scrubbed"
+}

@@ -1,0 +1,43 @@
+{
+  "name": "golden_18d_vk_b_stream",
+  "description": "chat as virtual key B — streamed, usage sniffed from SSE, priced",
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "Authorization": "Bearer vk-[REDACTED]"
+    },
+    "body": {
+      "model": "auto",
+      "messages": [
+        {
+          "role": "user",
+          "content": "/use:complex vk attribution b stream"
+        }
+      ],
+      "stream": true
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": [
+      "data: {\"id\":\"chatcmpl-stub-golden\",\"object\":\"chat.completion.chunk\",\"created\":1727000000,\"model\":\"stub-complex\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}",
+      "data: {\"id\":\"chatcmpl-stub-golden\",\"object\":\"chat.completion.chunk\",\"created\":1727000000,\"model\":\"stub-complex\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\" from\"},\"finish_reason\":null}]}",
+      "data: {\"id\":\"chatcmpl-stub-golden\",\"object\":\"chat.completion.chunk\",\"created\":1727000000,\"model\":\"stub-complex\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\" the stub.\",\"final\":true},\"finish_reason\":null}]}",
+      "data: {\"id\":\"chatcmpl-stub-golden\",\"object\":\"chat.completion.chunk\",\"created\":1727000000,\"model\":\"stub-complex\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":6,\"total_tokens\":11}}",
+      "data: [DONE]"
+    ]
+  },
+  "trace_events": [
+    {
+      "event": "route",
+      "tier": "complex",
+      "model": "stub-complex",
+      "upstream_status": 200,
+      "stream": true,
+      "provider": "openai"
+    }
+  ],
+  "volatile": false,
+  "notes": "stub-complex 5@1.25 + 6@5.0 = 6+30 = 36 micros; usage captured from the include_usage chunk"
+}

@@ -214,3 +214,47 @@ tracing:
   path: .router/traces.jsonl
   max_input_chars: 500
   max_file_mb: 50
+# ── Stage 4: billing plane ────────────────────────────────────────────────
+# Immutable, hash-chained cost ledger (SQLite WAL). Every successful
+# upstream completion appends one record (model, provider, key id,
+# virtual-key attribution, token counts, integer micro-USD costs, and the
+# exact price snapshot). Tamper-evident: GET /admin/ledger/verify, or
+# offline `python -m ledger verify`.
+#
+#   hmac_key_env: optional env NAME or 'ks:<alias>' — turns the chain from
+#     SHA-256 (corruption-evident) into HMAC-SHA256 (tamper-proof against
+#     anyone without the secret).
+ledger:
+  enabled: true
+  db_path: .router/ledger.sqlite3
+  hmac_key_env: ''                # e.g. ROUTER_LEDGER_HMAC_KEY or ks:ledger-hmac
+
+# Prices are integer-exact internally: USD per million tokens in, converted
+# to nano-USD. Costs accumulate in micro-USD (no float drift). Models not
+# listed use `default`; `free: true` entries record tokens at zero cost.
+pricing:
+  default:
+    input_per_mtok: 0.5
+    output_per_mtok: 1.5
+  entries:
+    glm-4.7:
+      input_per_mtok: 0.6
+      output_per_mtok: 2.2
+    minimax-m2.7:
+      input_per_mtok: 0.3
+      output_per_mtok: 1.2
+    some-free-model:
+      input_per_mtok: 0.0
+      output_per_mtok: 0.0
+      free: true
+
+# Virtual keys (subscriber attribution + blocking budgets):
+#   POST   /admin/virtual_keys        {name, budget_mode, budget_limit, budget_period}
+#   GET    /admin/virtual_keys        (with in-window spend)
+#   PATCH  /admin/virtual_keys/{id}   {enabled?, budget_mode?, budget_limit?, budget_period?}
+#   DELETE /admin/virtual_keys/{id}
+#   GET    /admin/ledger/verify | /admin/ledger/records | /admin/ledger/summary?group_by=model|key|session|day
+# budget_mode: none | tokens | cost_micros; budget_period: day | month | total.
+# A virtual key whose in-window spend is >= its budget gets HTTP 402
+# (budget_exceeded) BEFORE any upstream call. Virtual keys cannot access
+# /admin/* or /metrics (403) — the gateway admin key remains all-powerful.

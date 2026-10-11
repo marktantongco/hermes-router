@@ -36,6 +36,17 @@ def test_fixture_suite_is_present():
         "golden_15_pool_rotation",
         "golden_16_pool_exhausted",
         "golden_17_pool_stream_rotation",
+        "golden_18a_vk_a_create",
+        "golden_18b_vk_b_create",
+        "golden_18c_vk_a_nonstream",
+        "golden_18d_vk_b_stream",
+        "golden_18e_ledger_record_vk_a",
+        "golden_18f_ledger_record_vk_b",
+        "golden_19a_vk_c_create",
+        "golden_19b_budget_last_allowed",
+        "golden_19c_budget_block_402",
+        "golden_19d_virtual_keys_listing",
+        "golden_20_vk_admin_forbidden",
         "golden_90_health",
         "golden_91_metrics",
         "golden_92_admin_pools",
@@ -344,3 +355,103 @@ def test_92_admin_pools_contract():
     # no secret material anywhere in the admin surface
     assert "api_key" not in json.dumps(body) and "secret" not in json.dumps(body)
     assert all("ref" not in k for k in keys.values())
+
+
+# ── Stage 4 billing-plane contracts ──────────────────────────────────────
+
+def test_18_vk_create_contract():
+    """Virtual keys are created via POST /admin/virtual_keys; the plaintext
+    token is shown exactly once and never stored/pinned in the clear."""
+    for name, subscriber in (("golden_18a_vk_a_create", "subscriber-a"),
+                             ("golden_18b_vk_b_create", "subscriber-b")):
+        d = _load(name)
+        body = d["response"]["body"]
+        assert d["response"]["status"] == 201
+        assert body["name"] == subscriber
+        assert body["enabled"] == 1
+        assert body["budget_mode"] == "none"
+        assert body["key"] == "vk-[REDACTED]"  # token redacted in the fixture
+        assert d["request"]["headers"].get("Authorization") == "Bearer [set]"
+        assert d["request"]["body"] == {"name": subscriber}  # no budget fields
+
+
+def test_18_vk_attribution_contract():
+    """Exit-gate e2e: two virtual keys, each request attributed to its key
+    in the ledger; admin-key traffic (scenarios 01-17) stays unattributed."""
+    a = _load("golden_18e_ledger_record_vk_a")["response"]["body"]
+    b = _load("golden_18f_ledger_record_vk_b")["response"]["body"]
+    assert a["count"] == 1 and b["count"] == 1  # filters are per-key exact
+    rec_a, rec_b = a["records"][0], b["records"][0]
+    # VK_A: free-tier simple model, non-stream, primary attempt
+    assert rec_a["virtual_key_id"] == "VK_A"
+    assert rec_a["tier"] == "simple" and rec_a["model"] == "stub-simple"
+    assert rec_a["provider"] == "openai" and rec_a["stream"] == 0
+    assert rec_a["fallback_level"] == 0
+    assert rec_a["cost_total_micros"] == 0 and rec_a["price_source"] == "free"
+    # VK_B: priced complex model over SSE, primary attempt (stream record
+    # carries tier + level 0 — same numbering as the non-stream path)
+    assert rec_b["virtual_key_id"] == "VK_B"
+    assert rec_b["tier"] == "complex" and rec_b["model"] == "stub-complex"
+    assert rec_b["stream"] == 1 and rec_b["fallback_level"] == 0
+    assert rec_b["prompt_tokens"] == 5 and rec_b["completion_tokens"] == 6
+    # integer money math: 5 tok @ 1.25 $/Mtok = 6 micros (truncated),
+    # 6 tok @ 5.0 $/Mtok = 30 micros — no float drift
+    assert (rec_b["cost_input_micros"], rec_b["cost_output_micros"],
+            rec_b["cost_total_micros"]) == (6, 30, 36)
+    assert rec_b["price_input_nano"] == 1_250_000_000
+    assert rec_b["price_output_nano"] == 5_000_000_000
+    # hash-chain material scrubbed to stable labels
+    assert rec_a["row_hash"] == "[hash]" and rec_b["prev_hash"] == "[hash]"
+    # admin traffic is NOT attributed to any virtual key
+    assert a["total"] > a["count"]  # ledger holds the unattributed records too
+
+
+def test_19_budget_block_contract():
+    """Blocking budgets: last allowed request passes, the next is refused
+    pre-routing with 402 budget_exceeded (upstream never contacted)."""
+    create = _load("golden_19a_vk_c_create")["response"]["body"]
+    assert create["budget_mode"] == "cost_micros"
+    assert create["budget_limit"] == 36 and create["budget_period"] == "total"
+    allowed = _load("golden_19b_budget_last_allowed")
+    assert allowed["response"]["status"] == 200
+    assert allowed["response"]["body"]["model"] == "stub-complex"
+    blocked = _load("golden_19c_budget_block_402")
+    assert blocked["response"]["status"] == 402
+    err = blocked["response"]["body"]["error"]
+    assert err["type"] == "budget_exceeded"
+    assert err["detail"]["virtual_key_id"] == "VK_C"
+    assert err["detail"]["budget_mode"] == "cost_micros"
+    assert err["detail"]["budget_limit"] == 36 and err["detail"]["used"] == 36
+    # the gate runs before routing: no trace events, stub never contacted
+    assert blocked["trace_events"] == []
+
+
+def test_19d_virtual_keys_listing_contract():
+    """Admin listing shows all three keys with budget state; no secrets."""
+    d = _load("golden_19d_virtual_keys_listing")
+    body = d["response"]["body"]
+    assert d["response"]["status"] == 200
+    vks = {v["name"]: v for v in body["virtual_keys"]}
+    assert set(vks) == {"subscriber-a", "subscriber-b", "subscriber-c"}
+    assert vks["subscriber-c"]["budget_mode"] == "cost_micros"
+    assert vks["subscriber-c"]["budget_limit"] == 36
+    assert all("key" not in v for v in body["virtual_keys"])  # no tokens
+
+
+def test_20_vk_admin_forbidden_contract():
+    """Virtual keys are inference-only: admin surfaces reject them (403)."""
+    d = _load("golden_20_vk_admin_forbidden")
+    assert d["response"]["status"] == 403
+    body = d["response"]["body"]
+    assert body["detail"]["error"]["type"] == "admin_only"
+    assert d["request"]["headers"].get("Authorization") == "Bearer vk-[REDACTED]"
+
+
+def test_no_vk_plaintext_tokens_in_fixtures():
+    """Security sweep: no virtual-key token material anywhere in the suite."""
+    for path in GOLDEN_FILES:
+        raw = path.read_text()
+        assert "vk-3" not in raw and "vk-0" not in raw, \
+            f"possible plaintext token leak in {path.name}"
+        assert "[REDACTED]" in raw or '"key"' not in raw, \
+            f"unredacted key field in {path.name}"

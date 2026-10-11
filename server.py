@@ -126,6 +126,28 @@ except ImportError:  # catalog unavailable -> no-op
     def ingest_catalog_refs(cfg, store):  # type: ignore[misc,no-redef]
         return []
 
+# ── Immutable cost ledger (Stage 4) — hash-chained billing plane ──────────
+try:
+    from ledger import (
+        LedgerError,
+        PriceError,
+        build_ledger,
+        compute_cost,
+        evaluate_budget,
+    )
+except ImportError:  # ledger unavailable -> proxy works, billing plane off
+    class LedgerError(RuntimeError):  # type: ignore[no-redef]
+        pass
+    class PriceError(RuntimeError):  # type: ignore[no-redef]
+        pass
+    def build_ledger(cfg):  # type: ignore[misc,no-redef]
+        return None, None, None
+    def compute_cost(tokens, price_nano):  # type: ignore[misc,no-redef]
+        return 0
+    def evaluate_budget(ledger, vk):  # type: ignore[misc,no-redef]
+        return {"blocked": False, "mode": "none", "limit": 0,
+                "period": "total", "used": 0}
+
 # ── Zero-shot embedding classifier (optional, no LLM needed) ──────────────
 try:
     from zero_shot_classifier import get_zero_shot
@@ -913,6 +935,10 @@ METRICS: dict[str, int] = {
     "stream_requests_total": 0,
     "errors_total": 0,
     "requests_total": 0,  # total requests regardless of category
+    # Stage 4: billing plane
+    "ledger_appends_total": 0,
+    "ledger_append_failures_total": 0,
+    "ledger_budget_blocks_total": 0,
 }
 # Per-category request/429 counters are dynamic: requests_total_<cat>, 429_<cat>
 
@@ -1233,6 +1259,164 @@ def _translate_ok(
     return out
 
 
+# ── Stage 4: immutable cost ledger — append helpers + usage sniffer ────────
+
+class _UsageSniffer:
+    """Wraps a StreamTranslator; forwards bytes unchanged, records usage.
+
+    Input-line sniffing only: every SSE protocol in this codebase carries
+    usage inside ``data: {...}`` frames on the INPUT side (OpenAI final
+    usage chunk; Anthropic ``message_start``/``message_delta``), so the
+    wrapped translator's OUTPUT stays byte-exact no matter what.
+    """
+
+    __slots__ = ("_inner", "usage")
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.usage: dict[str, int] | None = None
+
+    def feed(self, line: str) -> list[bytes]:
+        if line and "usage" in line and line.startswith("data:"):
+            try:
+                data = json.loads(line[5:].strip())
+                if isinstance(data, dict) and isinstance(data.get("usage"), dict):
+                    self._merge(data["usage"])
+            except ValueError:
+                pass  # framing/malformed JSON — never break the stream
+        return self._inner.feed(line)
+
+    def _merge(self, raw: dict[str, Any]) -> None:
+        """Merge usage dicts (anthropic splits input/output across frames)."""
+        if self.usage is None:
+            self.usage = {}
+        for src, dst in (("prompt_tokens", "prompt_tokens"),
+                         ("completion_tokens", "completion_tokens"),
+                         ("input_tokens", "prompt_tokens"),
+                         ("output_tokens", "completion_tokens")):
+            if src in raw:
+                try:
+                    self.usage[dst] = int(raw[src])
+                except (TypeError, ValueError):
+                    pass
+        if "total_tokens" not in self.usage and \
+                "prompt_tokens" in self.usage and "completion_tokens" in self.usage:
+            self.usage["total_tokens"] = (
+                self.usage["prompt_tokens"] + self.usage["completion_tokens"])
+
+
+# Billing-plane globals (Stage 4). _LEDGER None == plane disabled.
+_LEDGER: Any = None    # ledger.Ledger | None
+_VKEYS: Any = None     # ledger.VirtualKeyStore | None
+_PRICING: Any = None   # ledger.PriceCatalog | None
+
+
+def _ledger_append(
+    *,
+    session_key: str | None,
+    attempt_cfg: dict,
+    stream: bool,
+    key_id: str | None,
+    fallback_level: int,
+    vk_id: str | None,
+    usage: dict[str, int] | None = None,
+    status: str = "ok",
+) -> None:
+    """Append one cost record. NEVER raises: billing failures must not
+    break proxying — they are counted and logged instead."""
+    if _LEDGER is None or _PRICING is None:
+        return
+    try:
+        model = str(attempt_cfg.get("model", "unknown"))
+        entry = _PRICING.lookup(model)
+        prompt = completion = total = 0
+        cost_in = cost_out = 0
+        if usage:
+            prompt = int(usage.get("prompt_tokens", 0) or 0)
+            completion = int(usage.get("completion_tokens", 0) or 0)
+            total = int(usage.get("total_tokens", prompt + completion) or 0)
+            cost_in = compute_cost(prompt, entry.input_nano)
+            cost_out = compute_cost(completion, entry.output_nano)
+        price_source = "free" if entry.free else entry.source
+        _LEDGER.append({
+            "record_type": "usage" if status == "ok" else "usage_missing",
+            "status": status,
+            "session_key": session_key,
+            "tier": attempt_cfg.get("tier"),
+            "model": model,
+            "provider": attempt_cfg.get("provider") or "openai",
+            "key_id": key_id,
+            "virtual_key_id": vk_id,
+            "fallback_level": int(fallback_level),
+            "stream": 1 if stream else 0,
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": total,
+            "cost_input_micros": cost_in,
+            "cost_output_micros": cost_out,
+            "cost_total_micros": cost_in + cost_out,
+            "price_input_nano": entry.input_nano,
+            "price_output_nano": entry.output_nano,
+            "price_source": price_source,
+            "price_snapshot_id": _PRICING.snapshot_id,
+        })
+        _inc_metric("ledger_appends_total")
+    except Exception as exc:  # noqa: BLE001 — ledger must never break routing
+        _inc_metric("ledger_append_failures_total")
+        log.warning("Ledger append failed: %s", exc)
+
+
+def _ledger_append_from_response(
+    *,
+    session_key: str | None,
+    model_cfg: dict,
+    data: dict | None,
+    key_id: str | None,
+    fallback_level: int,
+    vk_id: str | None,
+) -> None:
+    """Non-streaming append: usage from the (translated) response body."""
+    usage = None
+    status = "no_usage"
+    if isinstance(data, dict) and isinstance(data.get("usage"), dict) \
+            and data["usage"]:
+        usage = data["usage"]
+        status = "ok"
+    _ledger_append(session_key=session_key, attempt_cfg=model_cfg, stream=False,
+                   key_id=key_id, fallback_level=fallback_level, vk_id=vk_id,
+                   usage=usage, status=status)
+
+
+def _stage4_bootstrap(cfg: dict) -> list[str]:
+    """Open the billing plane; returns fatal errors (empty == ok).
+
+    All-or-nothing like _stage3_bootstrap: on any error the previous
+    ledger/vkey globals stay live and the candidate config is discarded.
+    A disabled ledger closes an already-open plane (reload path).
+    """
+    global _LEDGER, _VKEYS, _PRICING
+    try:
+        ledger, vkeys, pricing = build_ledger(cfg)
+    except (LedgerError, PriceError) as exc:
+        return [f"ledger: {exc}"]
+    except Exception as exc:  # noqa: BLE001 — bootstrap must be precise
+        return [f"ledger: unexpected {type(exc).__name__}: {exc}"]
+    if pricing is None:  # only when the ImportError shim is active
+        return []
+    # Commit phase
+    if _LEDGER is not None and _LEDGER is not ledger:
+        _LEDGER.close()
+    if _VKEYS is not None and _VKEYS is not vkeys:
+        _VKEYS.close()
+    _LEDGER, _VKEYS, _PRICING = ledger, vkeys, pricing
+    if ledger is not None:
+        log.info("  Billing plane: enabled (%s, %d records, snapshot %s)",
+                 ledger.path, ledger.count(), pricing.snapshot_id)
+    else:
+        log.info("  Billing plane: disabled (ledger.enabled false)")
+    return []
+
+
 async def call_model(
     cfg: dict, model_cfg: dict, request_payload: dict
 ) -> httpx.Response:
@@ -1438,7 +1622,8 @@ def _should_use_fallback(key: str) -> bool:
     return _RETRY_STATE.get(key, 0) >= _RETRY_MAX_BEFORE_FALLBACK
 
 
-async def route_request_stream(cfg: dict, payload: dict):
+async def route_request_stream(cfg: dict, payload: dict,
+                               virtual_key_id: str | None = None):
     """Streaming version of route_request — returns SSE chunks from upstream.
 
     Acts as a transparent proxy: opens an inner stream to the selected
@@ -1447,6 +1632,9 @@ async def route_request_stream(cfg: dict, payload: dict):
     so the gateway's own HERMES_STREAM_RETRIES can retry with a fresh
     connection.  On that retry the primary is skipped and fallback is used
     directly.
+
+    Stage 4: ``virtual_key_id`` attributes the cost record when a virtual
+    key authenticated the request (None = admin gateway key).
     """
     messages = payload.get("messages", [])
     key = session_key(messages)
@@ -1526,6 +1714,7 @@ async def route_request_stream(cfg: dict, payload: dict):
         yield b'data: {"error":{"message":"Category has no model config","type":"router_error"}}\n\ndata: [DONE]\n\n'
         return
     model_cfg = model_cfg.copy()
+    model_cfg["tier"] = category  # ledger attribution (mirrors route_request)
 
     # ── Build attempt list: primary, fallback1, fallback2 ─────────
     # Each entry: (label, model_cfg_dict)
@@ -1577,6 +1766,11 @@ async def route_request_stream(cfg: dict, payload: dict):
     # ── Try each tier in order until one streams successfully ───────────
     async with httpx.AsyncClient() as client:
         for attempt_idx, (attempt_label, attempt_cfg) in enumerate(tier_attempts):
+            # Ledger semantics (Stage 4): the level mirrors the attempt LABEL
+            # (primary=0, fallback1=1, fallback2=2), matching route_request —
+            # NOT the list index, because a 3-strike skip can start the list
+            # at fallback1.
+            attempt_level = 0 if attempt_label == "primary" else int(attempt_label[-1])
             model_name = attempt_cfg["model"]
             log.info("Streaming attempt %s: %s → %s", attempt_label, key, model_name)
 
@@ -1749,13 +1943,29 @@ async def route_request_stream(cfg: dict, payload: dict):
                                                 if attempt_label != "primary":
                                                     _inc_metric("fallback_used_total" if attempt_label == "fallback1" else "fallback2_used_total")
                                                 try:
-                                                    retry_translator = provider.open_stream_translator(payload, attempt_cfg)
+                                                    retry_sniffer = _UsageSniffer(
+                                                        provider.open_stream_translator(payload, attempt_cfg))
                                                     async for line in retry_resp.aiter_lines():
-                                                        for chunk in retry_translator.feed(line):
+                                                        for chunk in retry_sniffer.feed(line):
                                                             yield chunk
+                                                    _ledger_append(
+                                                        session_key=key,
+                                                        attempt_cfg=attempt_cfg,
+                                                        stream=True, key_id=key_label,
+                                                        fallback_level=attempt_level,
+                                                        vk_id=virtual_key_id,
+                                                        usage=retry_sniffer.usage,
+                                                        status="ok")
                                                     _clear_retry(key)
                                                     return  # clean completion
                                                 except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as stream_exc:
+                                                    _ledger_append(
+                                                        session_key=key,
+                                                        attempt_cfg=attempt_cfg,
+                                                        stream=True, key_id=key_label,
+                                                        fallback_level=attempt_level,
+                                                        vk_id=virtual_key_id,
+                                                        usage=None, status="interrupted")
                                                     log.warning("Stream interrupted for %s after 503 retry: %s", model_name, stream_exc)
                                                     cnt = _record_failure(key)
                                                     trace_stream_error(
@@ -1804,15 +2014,28 @@ async def route_request_stream(cfg: dict, payload: dict):
                             _inc_metric("fallback_used_total" if attempt_label == "fallback1" else "fallback2_used_total")
 
                         try:
-                            translator = provider.open_stream_translator(payload, attempt_cfg)
+                            sniffer = _UsageSniffer(
+                                provider.open_stream_translator(payload, attempt_cfg))
                             async for line in resp.aiter_lines():
-                                for chunk in translator.feed(line):
+                                for chunk in sniffer.feed(line):
                                     yield chunk
+                            _ledger_append(
+                                session_key=key, attempt_cfg=attempt_cfg,
+                                stream=True, key_id=key_label,
+                                fallback_level=attempt_level,
+                                vk_id=virtual_key_id,
+                                usage=sniffer.usage, status="ok")
                             _clear_retry(key)
                             return  # clean completion
 
                         except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as stream_exc:
                             # Mid-stream break — close cleanly, let gateway retry
+                            _ledger_append(
+                                session_key=key, attempt_cfg=attempt_cfg,
+                                stream=True, key_id=key_label,
+                                fallback_level=attempt_level,
+                                vk_id=virtual_key_id,
+                                usage=None, status="interrupted")
                             log.warning("Stream interrupted for %s: %s", model_name, stream_exc)
                             cnt = _record_failure(key)
                             trace_stream_error(
@@ -1846,10 +2069,14 @@ async def route_request_stream(cfg: dict, payload: dict):
     yield b'data: [DONE]\n\n'
 
 
-async def route_request(cfg: dict, payload: dict) -> JSONResponse:
+async def route_request(cfg: dict, payload: dict,
+                        virtual_key_id: str | None = None) -> JSONResponse:
     """
     Full routing pipeline.  Determines the category, calls the mapped
     model (with fallback), and returns a FastAPI JSONResponse.
+
+    Stage 4: ``virtual_key_id`` attributes the cost record when a virtual
+    key authenticated the request (None = admin gateway key).
     """
     messages = payload.get("messages", [])
     key = session_key(messages)
@@ -1960,6 +2187,10 @@ async def route_request(cfg: dict, payload: dict) -> JSONResponse:
             _clear_retry(key)
             data = resp.json()
             _annotate_provider(data, cat_cfg)
+            _ledger_append_from_response(
+                session_key=key, model_cfg=cat_cfg, data=data,
+                key_id=getattr(resp, "_hermes_key_id", None),
+                fallback_level=0, vk_id=virtual_key_id)
             return JSONResponse(content=data)
     else:
         resp = httpx.Response(503, text="Skipped primary due to consecutive failures")
@@ -2009,6 +2240,10 @@ async def route_request(cfg: dict, payload: dict) -> JSONResponse:
             provider=provider_name(fb_cfg),
             key_id=getattr(fb_resp, "_hermes_key_id", None),
         )
+        _ledger_append_from_response(
+            session_key=key, model_cfg=fb_cfg, data=data,
+            key_id=getattr(fb_resp, "_hermes_key_id", None),
+            fallback_level=1, vk_id=virtual_key_id)
         return JSONResponse(content=data)
 
     # ── Fallback 2 ─────────────────────────────────────────────────────────
@@ -2048,6 +2283,10 @@ async def route_request(cfg: dict, payload: dict) -> JSONResponse:
                 provider=provider_name(fb2_cfg),
                 key_id=getattr(fb2_resp, "_hermes_key_id", None),
             )
+            _ledger_append_from_response(
+                session_key=key, model_cfg=fb2_cfg, data=data,
+                key_id=getattr(fb2_resp, "_hermes_key_id", None),
+                fallback_level=2, vk_id=virtual_key_id)
             return JSONResponse(content=data)
         return _proxy_error(fb2_resp)
 
@@ -2105,31 +2344,50 @@ def _proxy_error(resp: httpx.Response) -> JSONResponse:
 
 # ── FastAPI Application ─────────────────────────────────────────────────────
 
-def verify_auth(request: Request):
-    """Check Bearer token against the configured auth key (Stage 1: mandatory).
+def verify_auth(request: Request, require_admin: bool = False) -> dict[str, Any]:
+    """Authenticate the request. Stage 4: returns a principal.
 
-    Resolution order for the expected key: ``auth.api_key_env`` may name an
-    environment variable or a keystore alias (``ks:<alias>``). Auth can only
-    be turned off with an explicit ``auth.mode: disabled`` (see
+    Two credential classes:
+      * the gateway admin key (auth.api_key_env) — full access, including
+        every /admin surface;
+      * a virtual key (``vk-...``, Stage 4 billing plane) — inference only,
+        attributed in the ledger, subject to its budget; FORBIDDEN on
+        admin surfaces when ``require_admin`` is set (403).
+
+    Resolution order for the admin key: ``auth.api_key_env`` may name an
+    environment variable or a keystore alias (``ks:<alias>``). Auth can
+    only be turned off with an explicit ``auth.mode: disabled`` (see
     validate_security_posture, which also refuses to start when a required
-    key is missing or empty).
+    key is missing or empty). Returns {"kind": "admin"} or
+    {"kind": "virtual_key", "vk": <row>}.
     """
     cfg = request.app.state.config
     if _auth_mode(cfg) == "disabled":
-        return  # explicit opt-out only
+        return {"kind": "admin"}  # explicit opt-out only
     auth = cfg.get("auth", {}) or {}
     ref = auth.get("api_key_env", "")
     expected = env_key(ref) if ref else ""
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
     if not expected:
         # Fail closed: required auth with no resolvable key rejects everything.
         raise HTTPException(
             status_code=401,
             detail={"error": {"message": "Auth required but no key configured", "type": "auth_error"}},
         )
-    auth_header = request.headers.get("Authorization", "")
-    token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
     if hmac.compare_digest(token, expected):
-        return
+        return {"kind": "admin"}
+    # Stage 4: virtual-key lookup (hash-indexed; no plaintext at rest).
+    if _VKEYS is not None and token.startswith("vk-"):
+        vk = _VKEYS.authenticate(token)
+        if vk is not None:
+            if require_admin:
+                raise HTTPException(
+                    status_code=403,
+                    detail={"error": {"message": "Virtual keys cannot access admin surfaces",
+                                      "type": "admin_only"}},
+                )
+            return {"kind": "virtual_key", "vk": vk}
     raise HTTPException(
         status_code=401,
         detail={"error": {"message": "Invalid or missing API key", "type": "auth_error"}},
@@ -2265,6 +2523,10 @@ def _startup() -> None:
     for fatal in _stage3_bootstrap(cfg):
         log.fatal("Refusing to start: %s", fatal)
         sys.exit(1)
+    # Stage 4: billing plane (fail-closed; ledger.enabled false = off)
+    for fatal in _stage4_bootstrap(cfg):
+        log.fatal("Refusing to start: %s", fatal)
+        sys.exit(1)
     log.info("Router starting on %s:%s", cfg["server"]["host"], cfg["server"]["port"])
     log.info("  Classifier: %s (%s)", cfg["classifier"]["model"], cfg["classifier"]["base_url"])
     cats = cfg.get("categories", {})
@@ -2323,7 +2585,7 @@ async def reload_config(request: Request):
     swaps app.state.config. Clears profile_hint to force re-extraction
     on the next classification request.
     """
-    verify_auth(request)
+    verify_auth(request, require_admin=True)
 
     old_cfg = request.app.state.config
     old_cats = list(old_cfg.get("categories", {}).keys())
@@ -2368,6 +2630,15 @@ async def reload_config(request: Request):
             detail={"error": {"message": "; ".join(stage3_errors), "type": "reload_error"}},
         )
 
+    # Stage 4: billing plane must rebuild before the swap is accepted
+    # (same all-or-nothing guarantee; a disabled ledger closes the plane).
+    stage4_errors = _stage4_bootstrap(new_cfg)
+    if stage4_errors:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"message": "; ".join(stage4_errors), "type": "reload_error"}},
+        )
+
     # Clear profile_hint so extraction runs with fresh config
     new_cfg["classifier"]["profile_hint"] = ""
 
@@ -2398,7 +2669,7 @@ async def reload_config(request: Request):
 @app.get("/circuits")
 async def list_circuits(request: Request):
     """List all circuit breaker states."""
-    verify_auth(request)
+    verify_auth(request, require_admin=True)
     return {
         "circuits": CIRCUITS,
         "defaults": CB_DEFAULTS,
@@ -2408,7 +2679,7 @@ async def list_circuits(request: Request):
 @app.post("/circuits/reset")
 async def reset_circuits(request: Request):
     """Reset all circuit breakers back to closed state."""
-    verify_auth(request)
+    verify_auth(request, require_admin=True)
     count = len(CIRCUITS)
     CIRCUITS.clear()
     log.info("Reset %d circuit breakers", count)
@@ -2418,7 +2689,7 @@ async def reset_circuits(request: Request):
 @app.get("/admin/sessions")
 async def list_sessions(request: Request):
     """List all cached sessions with tier info."""
-    verify_auth(request)
+    verify_auth(request, require_admin=True)
     now = time.time()
     cfg = request.app.state.config
     timeout_mins = cfg["classifier"].get("session_timeout_minutes", 5)
@@ -2437,7 +2708,7 @@ async def list_sessions(request: Request):
 @app.delete("/admin/sessions/{key}")
 async def evict_session(key: str, request: Request):
     """Force-evict a cached session, forcing re-classification on next message."""
-    verify_auth(request)
+    verify_auth(request, require_admin=True)
     removed = SESSIONS.pop(key, None)
     if removed:
         log.info("Session %s evicted (was %s)", key, removed["tier"])
@@ -2632,7 +2903,7 @@ async def classifier_report(request: Request, format: str = "json"):
     Query params:
         format: 'json' (default) or 'html' for a human-readable HTML page.
     """
-    verify_auth(request)
+    verify_auth(request, require_admin=True)
     cfg = request.app.state.config
     report = _build_classifier_report(cfg)
     
@@ -2753,7 +3024,7 @@ code {{ background: #21262d; padding: 2px 6px; border-radius: 4px; }}
 @app.get("/admin/config")
 async def get_config(request: Request):
     """Return current config with sensitive keys redacted."""
-    verify_auth(request)
+    verify_auth(request, require_admin=True)
     cfg_copy = copy.deepcopy(request.app.state.config)
     # Redact env var names (not values — those stay in env, not config)
     # No actual API keys are in the config, just env var names.
@@ -2764,7 +3035,7 @@ async def get_config(request: Request):
 @app.get("/admin/providers")
 async def list_providers(request: Request):
     """Stage 2: provider registry — capability metadata + per-category resolution."""
-    verify_auth(request)
+    verify_auth(request, require_admin=True)
     cfg = request.app.state.config
     categories: dict[str, Any] = {}
     for name, cat in (cfg.get("categories") or {}).items():
@@ -2790,7 +3061,7 @@ async def list_pools(request: Request):
     Metadata only: key references are shown by kind (env/keystore), never
     by value. Cooldown remaining fields are volatile by nature.
     """
-    verify_auth(request)
+    verify_auth(request, require_admin=True)
     pools = [pool.snapshot() for pool in all_pools().values()]
     return {"pools": pools, "count": len(pools)}
 
@@ -2798,7 +3069,7 @@ async def list_pools(request: Request):
 @app.post("/admin/pools/{name}/unlock")
 async def unlock_pool(name: str, request: Request):
     """Stage 3: clear quarantine + cooldowns on one pool (operator action)."""
-    verify_auth(request)
+    verify_auth(request, require_admin=True)
     try:
         pool = get_pool(name)
     except PoolError as exc:
@@ -2814,7 +3085,7 @@ async def unlock_pool(name: str, request: Request):
 @app.get("/admin/catalog")
 async def get_catalog(request: Request):
     """Stage 3: free-tier catalog summary (provider facts + limits)."""
-    verify_auth(request)
+    verify_auth(request, require_admin=True)
     if _CATALOG is None:
         return {"catalog": None, "note": "no catalog section configured"}
     return {"catalog": _CATALOG.summary()}
@@ -2827,7 +3098,7 @@ async def refresh_catalog(request: Request):
     Last-good document stays live on failure; the error is returned for
     operator visibility and counted in the metrics.
     """
-    verify_auth(request)
+    verify_auth(request, require_admin=True)
     if _CATALOG is None:
         raise HTTPException(
             status_code=404,
@@ -2849,20 +3120,197 @@ async def refresh_catalog(request: Request):
                                       if k != "providers"}}
 
 
+# ── Stage 4: billing plane admin surfaces (admin key ONLY) ─────────────────
+
+def _vk_public(row: dict) -> dict:
+    """Virtual-key projection without the token hash."""
+    return {k: row[k] for k in ("id", "name", "created_at", "enabled",
+                                "budget_mode", "budget_limit", "budget_period")}
+
+
+@app.post("/admin/virtual_keys")
+async def create_virtual_key(request: Request):
+    """Create a subscriber virtual key. The plaintext token is returned
+    EXACTLY ONCE (only its SHA-256 is stored)."""
+    verify_auth(request, require_admin=True)
+    if _LEDGER is None or _VKEYS is None:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": {"message": "Billing plane disabled (ledger.enabled false)",
+                              "type": "ledger_disabled"}},
+        )
+    body = await request.json()
+    try:
+        row = _VKEYS.create(
+            str(body.get("name", "")),
+            budget_mode=str(body.get("budget_mode", "none")),
+            budget_limit=int(body.get("budget_limit", 0) or 0),
+            budget_period=str(body.get("budget_period", "total")),
+        )
+    except LedgerError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"message": str(exc), "type": "invalid_virtual_key"}},
+        )
+    out = _vk_public(row)
+    out["key"] = row["key"]
+    return JSONResponse(status_code=201, content=out)
+
+
+@app.get("/admin/virtual_keys")
+async def list_virtual_keys(request: Request):
+    """List virtual keys with in-window spend (no token material)."""
+    verify_auth(request, require_admin=True)
+    if _VKEYS is None or _LEDGER is None:
+        return {"virtual_keys": [], "count": 0, "ledger": "disabled"}
+    out = []
+    for row in _VKEYS.list():
+        pub = _vk_public(row)
+        if row["budget_mode"] != "none":
+            pub["spent"] = _LEDGER.spent_for_key(row["id"], row["budget_period"])
+        out.append(pub)
+    return {"virtual_keys": out, "count": len(out)}
+
+
+@app.patch("/admin/virtual_keys/{vk_id}")
+async def update_virtual_key(vk_id: str, request: Request):
+    """Enable/disable a virtual key and/or update its budget."""
+    verify_auth(request, require_admin=True)
+    if _VKEYS is None or _LEDGER is None:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": {"message": "Billing plane disabled (ledger.enabled false)",
+                              "type": "ledger_disabled"}},
+        )
+    body = await request.json()
+    if _VKEYS.get(vk_id) is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": {"message": f"Unknown virtual key: {vk_id}",
+                              "type": "unknown_virtual_key"}},
+        )
+    if "enabled" in body:
+        _VKEYS.set_enabled(vk_id, bool(body["enabled"]))
+    if {"budget_mode", "budget_limit", "budget_period"} & set(body):
+        cur = _VKEYS.get(vk_id)
+        _VKEYS.update_budget(
+            vk_id,
+            budget_mode=str(body.get("budget_mode", cur["budget_mode"])),
+            budget_limit=int(body.get("budget_limit", cur["budget_limit"]) or 0),
+            budget_period=str(body.get("budget_period", cur["budget_period"])),
+        )
+    return {"status": "updated", "virtual_key": _vk_public(_VKEYS.get(vk_id))}
+
+
+@app.delete("/admin/virtual_keys/{vk_id}")
+async def delete_virtual_key(vk_id: str, request: Request):
+    """Delete a virtual key. Ledger rows keep their historical attribution."""
+    verify_auth(request, require_admin=True)
+    if _VKEYS is None:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": {"message": "Billing plane disabled (ledger.enabled false)",
+                              "type": "ledger_disabled"}},
+        )
+    if not _VKEYS.delete(vk_id):
+        raise HTTPException(
+            status_code=404,
+            detail={"error": {"message": f"Unknown virtual key: {vk_id}",
+                              "type": "unknown_virtual_key"}},
+        )
+    return {"status": "deleted", "id": vk_id}
+
+
+@app.get("/admin/ledger/verify")
+async def ledger_verify(request: Request):
+    """Recompute the full hash chain — the tamper-evidence surface."""
+    verify_auth(request, require_admin=True)
+    if _LEDGER is None:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": {"message": "Billing plane disabled (ledger.enabled false)",
+                              "type": "ledger_disabled"}},
+        )
+    report = _LEDGER.verify()
+    return {**report, "price_snapshot_id": _PRICING.snapshot_id}
+
+
+@app.get("/admin/ledger/records")
+async def ledger_records(request: Request, limit: int = 50, offset: int = 0,
+                         virtual_key_id: str | None = None):
+    """Recent ledger rows (newest first). Default hides admin traffic."""
+    verify_auth(request, require_admin=True)
+    if _LEDGER is None:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": {"message": "Billing plane disabled (ledger.enabled false)",
+                              "type": "ledger_disabled"}},
+        )
+    rows = _LEDGER.records(limit=limit, offset=offset, virtual_key_id=virtual_key_id)
+    return {"records": rows, "count": len(rows), "total": _LEDGER.count()}
+
+
+@app.get("/admin/ledger/summary")
+async def ledger_summary(request: Request, group_by: str = "model",
+                         since: str = "", until: str = "",
+                         virtual_key_id: str | None = None):
+    """Aggregate spend: group_by = model | key | session | day."""
+    verify_auth(request, require_admin=True)
+    if _LEDGER is None:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": {"message": "Billing plane disabled (ledger.enabled false)",
+                              "type": "ledger_disabled"}},
+        )
+    try:
+        rows = _LEDGER.summary(group_by, since=since, until=until,
+                               virtual_key_id=virtual_key_id)
+    except LedgerError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"message": str(exc), "type": "invalid_summary_args"}},
+        )
+    return {"group_by": group_by, "groups": rows, "count": len(rows)}
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """OpenAI-compatible chat completions — routed automatically."""
-    verify_auth(request)
+    principal = verify_auth(request)
     cfg = request.app.state.config
+
+    # Stage 4: blocking budget gate (BEFORE any upstream call).
+    if principal["kind"] == "virtual_key" and _LEDGER is not None:
+        verdict = evaluate_budget(_LEDGER, principal["vk"])
+        if verdict["blocked"]:
+            _inc_metric("ledger_budget_blocks_total")
+            log.warning("Budget block for %s (%s): used %d >= limit %d %s",
+                        principal["vk"]["id"], principal["vk"]["name"],
+                        verdict["used"], verdict["limit"], verdict["period"])
+            return JSONResponse(status_code=402, content={
+                "error": {
+                    "message": "Budget exceeded for virtual key",
+                    "type": "budget_exceeded",
+                    "detail": {
+                        "virtual_key_id": principal["vk"]["id"],
+                        "budget_mode": verdict["mode"],
+                        "budget_period": verdict["period"],
+                        "budget_limit": verdict["limit"],
+                        "used": verdict["used"],
+                    },
+                }})
+
+    vk_id = (principal["vk"]["id"]
+             if principal["kind"] == "virtual_key" else None)
     payload = await request.json()
     try:
         if payload.get("stream"):
             _inc_metric("stream_requests_total")
             return StreamingResponse(
-                route_request_stream(cfg, payload),
+                route_request_stream(cfg, payload, virtual_key_id=vk_id),
                 media_type="text/event-stream",
             )
-        return await route_request(cfg, payload)
+        return await route_request(cfg, payload, virtual_key_id=vk_id)
     except Exception:
         _inc_metric("errors_total")
         raise
@@ -2871,7 +3319,7 @@ async def chat_completions(request: Request):
 @app.get("/metrics")
 async def metrics(request: Request):
     """Prometheus-compatible metrics endpoint with router-specific counters."""
-    verify_auth(request)
+    verify_auth(request, require_admin=True)
     m = _get_metrics()
     cfg = request.app.state.config
     cats = cfg.get("categories", {})
@@ -2957,6 +3405,20 @@ async def metrics(request: Request):
         lines.append(
             f'hermes_router_pool_keys_available{{pool="{pool.name}"}} {now["keys_available"]}')
     lines += [""]
+    # Stage 4: billing plane counters
+    lines += [
+        "",
+        "# HELP hermes_router_ledger_appends_total Ledger records appended",
+        "# TYPE hermes_router_ledger_appends_total counter",
+        f"hermes_router_ledger_appends_total {m.get('ledger_appends_total', 0)}",
+        "# HELP hermes_router_ledger_append_failures_total Ledger append failures (billing visibility loss)",
+        "# TYPE hermes_router_ledger_append_failures_total counter",
+        f"hermes_router_ledger_append_failures_total {m.get('ledger_append_failures_total', 0)}",
+        "# HELP hermes_router_ledger_budget_blocks_total Requests blocked by virtual-key budgets",
+        "# TYPE hermes_router_ledger_budget_blocks_total counter",
+        f"hermes_router_ledger_budget_blocks_total {m.get('ledger_budget_blocks_total', 0)}",
+        "",
+    ]
     return JSONResponse(
         content={"metrics": m, "prometheus": "\n".join(lines)},
     )
@@ -2983,6 +3445,11 @@ if __name__ == "__main__":
     # Stage 3: pools + catalog must build before the socket binds.
     for s3_err in _stage3_bootstrap(cfg):
         log.fatal("Refusing to start: %s", s3_err)
+        sys.exit(1)
+
+    # Stage 4: billing plane must build before the socket binds.
+    for s4_err in _stage4_bootstrap(cfg):
+        log.fatal("Refusing to start: %s", s4_err)
         sys.exit(1)
 
     # Stage 1: localhost is the default bind. Environment overrides exist for

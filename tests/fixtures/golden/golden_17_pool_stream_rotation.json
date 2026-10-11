@@ -24,6 +24,7 @@
       "data: {\"id\":\"chatcmpl-stub-golden\",\"object\":\"chat.completion.chunk\",\"created\":1727000000,\"model\":\"stub-simple\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}",
       "data: {\"id\":\"chatcmpl-stub-golden\",\"object\":\"chat.completion.chunk\",\"created\":1727000000,\"model\":\"stub-simple\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\" from\"},\"finish_reason\":null}]}",
       "data: {\"id\":\"chatcmpl-stub-golden\",\"object\":\"chat.completion.chunk\",\"created\":1727000000,\"model\":\"stub-simple\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\" the stub.\",\"final\":true},\"finish_reason\":null}]}",
+      "data: {\"id\":\"chatcmpl-stub-golden\",\"object\":\"chat.completion.chunk\",\"created\":1727000000,\"model\":\"stub-simple\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":6,\"total_tokens\":11}}",
       "data: [DONE]"
     ]
   },

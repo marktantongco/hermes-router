@@ -216,6 +216,42 @@ categories:
 
 Introspect the live registry and per-category resolution at `GET /admin/providers` (auth required). Trace `route` events carry `provider` attribution; non-default providers annotate success responses with `hermes_router.provider`. Adapter limitations (documented in `providers.py`): unsupported OpenAI fields (`n`, `logprobs`, `response_format`, ...) are dropped with a debug log; `tool_choice: "none"` drops tools entirely; images accept data URIs and http(s) URLs.
 
+### Billing Plane (Stage 4)
+
+Every successful upstream completion becomes **one append-only, hash-chained cost record** in a SQLite (WAL) ledger: model, provider, key attribution (pool key ids), virtual-key attribution, token counts, integer micro-USD costs, and the exact price snapshot used. Records are linked `row_hash = SHA-256(canonical_json(record))` (or HMAC-SHA256 when `hmac_key_env` is set), so field edits, row deletions, and tail truncation are all detectable — `GET /admin/ledger/verify` recomputes the chain live, and `python -m ledger verify` does it offline. Money math is integer-only end to end: prices are stored as nano-USD per million tokens, costs accumulate as micro-USD — no floating-point drift.
+
+**Virtual keys** (`vk-<32 hex>`, plaintext shown once, only the SHA-256 stored) attribute downstream traffic per subscriber. Each request presented with a virtual key is checked **before routing**: if its in-window spend (or token count) reached the budget, the router answers `402 budget_exceeded` and the upstream is never contacted. Virtual keys are inference-only — every admin surface and `/metrics` reject them with `403 admin_only`.
+
+```yaml
+ledger:
+  enabled: true
+  db_path: .router/ledger.sqlite3
+  hmac_key_env: ''            # env NAME or ks:<alias> — upgrades the chain to HMAC
+
+pricing:
+  default: {input_per_mtok: 0.5, output_per_mtok: 1.5}
+  entries:
+    glm-4.7: {input_per_mtok: 0.6, output_per_mtok: 2.2}
+    local-free-model: {input_per_mtok: 0.0, output_per_mtok: 0.0, free: true}
+```
+
+Manage subscribers and inspect spend (admin key required):
+
+```bash
+# create (token printed exactly once)
+curl -X POST /admin/virtual_keys -H "Authorization: Bearer $ADMIN" \
+     -d '{"name": "subscriber-a", "budget_mode": "cost_micros",
+          "budget_limit": 5000000, "budget_period": "month"}'
+# in-window spend per key
+curl /admin/virtual_keys -H "Authorization: Bearer $ADMIN"
+# aggregate spend by model / key / session / day
+curl "/admin/ledger/summary?group_by=model" -H "Authorization: Bearer $ADMIN"
+# tamper evidence
+curl /admin/ledger/verify -H "Authorization: Bearer $ADMIN"
+```
+
+Ledger failures never break proxying — a failed append is counted (`ledger_append_failures_total`) and logged, and the request still completes. With `ledger.enabled: false` the whole plane is inert (admin ledger endpoints answer `409 ledger_disabled`).
+
 ### Circuit Breaker
 
 ```yaml
@@ -271,6 +307,16 @@ persona:
 | `/admin/sessions` | GET | Required | List all cached sessions with tier + age |
 | `/admin/sessions/{key}` | DELETE | Required | Force-evict a cached session |
 | `/admin/config` | GET | Required | Show live config (env var names only, no secrets) |
+| `/admin/providers` | GET | Required | Provider registry + per-category adapter resolution (Stage 2) |
+| `/admin/pools` | GET | Required | Key-pool state: keys, counters, cooldowns (Stage 3) |
+| `/admin/pools/{name}/unlock` | POST | Required | Lift a quarantine/cooldown on a pooled key (Stage 3) |
+| `/admin/catalog` | GET | Required | Free-tier catalog snapshot + refresh status (Stage 3) |
+| `/admin/catalog/refresh` | POST | Required | Pull a fresh catalog (opt-in remote) (Stage 3) |
+| `/admin/virtual_keys` | POST | GET | Required | Create / list subscriber virtual keys with in-window spend (Stage 4) |
+| `/admin/virtual_keys/{id}` | PATCH | DELETE | Required | Update budget/enabled / revoke a virtual key (Stage 4) |
+| `/admin/ledger/verify` | GET | Required | Recompute the full hash chain — tamper evidence (Stage 4) |
+| `/admin/ledger/records` | GET | Required | Recent cost records; `?virtual_key_id=` filters per subscriber (Stage 4) |
+| `/admin/ledger/summary` | GET | Required | Aggregate spend: `?group_by=model\|key\|session\|day` (Stage 4) |
 | `/circuits` | GET | Required | List all circuit breaker states |
 | `/circuits/reset` | POST | Required | Reset all circuit breakers to closed |
 | `/classifier/report` | GET | Required | Surrogate coverage, confidence distribution, routing stats, drift timeline. `?format=html` for dark-themed dashboard |

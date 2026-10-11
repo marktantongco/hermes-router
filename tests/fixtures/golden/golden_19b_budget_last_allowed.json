@@ -1,0 +1,57 @@
+{
+  "name": "golden_19b_budget_last_allowed",
+  "description": "VK_C first /use:complex request passes and spends exactly 36 micros",
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "Authorization": "Bearer vk-[REDACTED]"
+    },
+    "body": {
+      "model": "auto",
+      "messages": [
+        {
+          "role": "user",
+          "content": "/use:complex budget check one"
+        }
+      ],
+      "stream": false
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "id": "chatcmpl-stub-golden",
+      "object": "chat.completion",
+      "created": 1727000000,
+      "model": "stub-complex",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Stub response for golden fixture."
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 5,
+        "completion_tokens": 6,
+        "total_tokens": 11
+      }
+    }
+  },
+  "trace_events": [
+    {
+      "event": "route",
+      "tier": "complex",
+      "model": "stub-complex",
+      "upstream_status": 200,
+      "stream": false,
+      "provider": "openai"
+    }
+  ],
+  "volatile": false,
+  "notes": "spent (36) == limit (36) blocks the NEXT request"
+}

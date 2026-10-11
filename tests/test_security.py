@@ -29,7 +29,7 @@ ROUTER_PORT = 9912
 ROUTER_URL = f"http://127.0.0.1:{ROUTER_PORT}"
 TEST_KEY = "security-test-key-7f3a"
 RUNTIME_FILES = ["server.py", "providers.py", "trace.py", "keystore.py",
-                 "keypool.py", "catalog.py",
+                 "keypool.py", "catalog.py", "ledger.py",
                  "surrogate_models.py", "zero_shot_classifier.py",
                  "fasttext_classifier.py", "setfit_classifier.py"]
 

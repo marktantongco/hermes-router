@@ -1,0 +1,40 @@
+{
+  "name": "golden_19c_budget_block_402",
+  "description": "VK_C second request — blocked 402 BEFORE any upstream call",
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "Authorization": "Bearer vk-[REDACTED]"
+    },
+    "body": {
+      "model": "auto",
+      "stream": false,
+      "messages": [
+        {
+          "role": "user",
+          "content": "/use:complex budget check two"
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 402,
+    "body": {
+      "error": {
+        "message": "Budget exceeded for virtual key",
+        "type": "budget_exceeded",
+        "detail": {
+          "virtual_key_id": "VK_C",
+          "budget_mode": "cost_micros",
+          "budget_period": "total",
+          "budget_limit": 36,
+          "used": 36
+        }
+      }
+    }
+  },
+  "trace_events": [],
+  "volatile": false,
+  "notes": "HTTP 402 budget_exceeded; gate runs pre-routing, so the stub upstream is never contacted"
+}
