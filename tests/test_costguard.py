@@ -601,7 +601,7 @@ ROUTER_URL = f"http://127.0.0.1:{ROUTER_PORT}"
 STUB_URL = f"http://127.0.0.1:{STUB_PORT}"
 ADMIN_KEY = "costguard-e2e-admin-key"
 RUNTIME_FILES = ["server.py", "providers.py", "trace.py", "keystore.py",
-                 "keypool.py", "catalog.py", "ledger.py", "costguard.py",
+                 "keypool.py", "catalog.py", "ledger.py", "costguard.py", "alerts.py", "dashboard.py",
                  "surrogate_models.py", "zero_shot_classifier.py",
                  "fasttext_classifier.py", "setfit_classifier.py"]
 

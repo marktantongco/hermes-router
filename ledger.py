@@ -459,10 +459,16 @@ class Ledger:
         with self._lock:
             return [dict(r) for r in self._conn.execute(q, args).fetchall()]
 
-    def count(self) -> int:
+    def count(self, virtual_key_id: str | None = None) -> int:
+        """Total rows (optionally filtered by virtual key — Stage 6
+        dashboard pagination under a ?vk= filter)."""
+        q = "SELECT COUNT(*) AS n FROM ledger"
+        args: list[Any] = []
+        if virtual_key_id is not None:
+            q += " WHERE virtual_key_id = ?"
+            args.append(virtual_key_id)
         with self._lock:
-            return int(self._conn.execute(
-                "SELECT COUNT(*) AS n FROM ledger").fetchone()["n"])
+            return int(self._conn.execute(q, args).fetchone()["n"])
 
     def spent_for_key(self, virtual_key_id: str, period: str) -> dict[str, int]:
         """Spend for one virtual key inside its budget window."""

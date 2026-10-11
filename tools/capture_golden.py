@@ -50,6 +50,11 @@ REPO = Path(__file__).resolve().parents[1]
 FIXTURE_DIR = REPO / "tests" / "fixtures" / "golden"
 CONFIG_SRC = REPO / "tests" / "fixtures" / "router_config.fixture.yaml"
 
+# Stage 6: the dashboard section ids are a published contract — import
+# the single source instead of duplicating the list here.
+sys.path.insert(0, str(REPO))
+from dashboard import DASHBOARD_SECTIONS  # noqa: E402
+
 STUB_PORT = 9901
 ROUTER_PORT = 9902
 STUB_URL = f"http://127.0.0.1:{STUB_PORT}/v1"
@@ -83,6 +88,8 @@ RUNTIME_FILES = [
     "catalog.py",
     "ledger.py",
     "costguard.py",
+    "alerts.py",
+    "dashboard.py",
     "surrogate_models.py",
     "zero_shot_classifier.py",
     "fasttext_classifier.py",
@@ -779,6 +786,76 @@ def run_scenarios(client: httpx.Client, trace_path: Path) -> list[dict]:
            volatile=True,
            request_headers={"Authorization": "Bearer [set]"})
 
+    # ── Stage 6: operations plane — alerts + dashboard ──────────────────
+
+    def scrub_alerts(obj: Any, mapping: dict[str, str]) -> Any:
+        """Alert fixture scrub: vk ids inside alert ids/details, all
+        timestamps (first_seen/last_seen/history ts)."""
+        if isinstance(obj, dict):
+            out: dict[str, Any] = {}
+            for k, v in obj.items():
+                if k in ("first_seen", "last_seen", "ts"):
+                    out[k] = "[ts]"
+                elif k == "id" and isinstance(v, str) and ":" in v:
+                    prefix, _, suffix = v.partition(":")
+                    out[k] = f"{prefix}:{mapping.get(suffix, suffix)}"
+                elif k == "virtual_key_id" and isinstance(v, str) \
+                        and v in mapping:
+                    out[k] = mapping[v]
+                else:
+                    out[k] = scrub_alerts(v, mapping)
+            return out
+        if isinstance(obj, list):
+            return [scrub_alerts(x, mapping) for x in obj]
+        if isinstance(obj, str) and obj in mapping:
+            return mapping[obj]
+        return obj
+
+    # 94 — Stage 6: alert engine snapshot. Deterministic at this point in
+    # the scenario order: VK_C sits exactly at its 36-micros total budget
+    # (critical budget alert) and scenario 24a injected the single
+    # watchdog 402 seconds ago (critical billing_leak alert). Pool and
+    # circuit rules are disabled in the fixture config because their
+    # state is timing-dependent mid-capture.
+    r = client.get(f"{ROUTER_URL}/admin/alerts", headers={"Authorization": AUTH_HEADER})
+    record("golden_94_admin_alerts",
+           "GET /admin/alerts — first evaluation: budget:VK_C (36/36 "
+           "cost_micros, critical) + billing_leak (single 402 in window, "
+           "critical) raise; raised_now == active; history records both",
+           None, "/admin/alerts", "GET", r.status_code,
+           scrub_alerts(r.json(), VK_MAP), None,
+           notes="vk ids inside alert ids/details mapped to VK_* labels; "
+                 "first_seen/last_seen/history ts scrubbed; stats "
+                 "deterministic (single evaluation so far); webhook "
+                 "unconfigured so webhook counters stay 0",
+           volatile=True,
+           request_headers={"Authorization": "Bearer [set]"})
+
+    # 95 — Stage 6: dashboard structure. Values are volatile (uptime,
+    # generated_at, ledger rows); the pinned contract is the page shape:
+    # title, the nine stable section ids, HTML content type and the
+    # zero-external-assets rule (no script tags, no auto-refresh by
+    # default).
+    r = client.get(f"{ROUTER_URL}/dashboard", headers={"Authorization": AUTH_HEADER})
+    section_ids = [sid for sid in DASHBOARD_SECTIONS
+                   if f'id="{sid}"' in r.text]
+    record("golden_95_dashboard",
+           "GET /dashboard — admin HTML ops page; structure-only snapshot "
+           "(title + section ids + zero-asset contract)",
+           None, "/dashboard", "GET", r.status_code,
+           {"content_type": r.headers.get("content-type", ""),
+            "title": "Hermes Router — Operations Dashboard",
+            "section_ids": section_ids,
+            "has_scripts": "<script" in r.text,
+            "has_refresh_meta": 'http-equiv="refresh"' in r.text},
+           None,
+           notes="Section ids are the deep-link contract (operators and "
+                 "fixture asserts depend on them); uptime/generated_at/"
+                 "spend values are volatile so only structure is recorded; "
+                 "zero external assets by design",
+           volatile=True,
+           request_headers={"Authorization": "Bearer [set]"})
+
     return fixtures
 
 
@@ -882,6 +959,11 @@ def main() -> None:
                 "limiter boundaries (VK_D/VK_E with reconciliation proof), pool-scope "
                 "gate (guard_pool) and the injected-402 watchdog; snapshot 93 pins "
                 "the /admin/costguard state (VK_D/VK_E labels, ts scrubbed)",
+                "Stage 6: snapshot 94 pins the first alert evaluation (budget:VK_C "
+                "exhausted + billing_leak from 24a, both critical, raised_now == "
+                "active); snapshot 95 pins the dashboard structure contract "
+                "(section ids, zero-asset rule); /metrics gains the alerts_* "
+                "counter family while the alerts section is enabled",
                 "Re-capture at every stage boundary; diff = behavior regression signal",
             ],
             "fixtures": [f["name"] for f in fixtures],

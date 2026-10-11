@@ -489,7 +489,7 @@ class TestLivePoolRotation:
         for fname in ["server.py", "providers.py", "trace.py", "keystore.py",
                       "keypool.py", "catalog.py", "surrogate_models.py",
                       "zero_shot_classifier.py", "fasttext_classifier.py",
-                      "setfit_classifier.py"]:
+                      "setfit_classifier.py", "alerts.py", "dashboard.py"]:
             shutil.copy2(repo / fname, tmp / fname)
         (tmp / "router_config.yaml").write_text(
             yaml.safe_dump(_e2e_pool_config(stub_port, router_port)))

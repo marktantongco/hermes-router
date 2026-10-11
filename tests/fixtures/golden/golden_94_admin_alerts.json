@@ -1,0 +1,141 @@
+{
+  "name": "golden_94_admin_alerts",
+  "description": "GET /admin/alerts — first evaluation: budget:VK_C (36/36 cost_micros, critical) + billing_leak (single 402 in window, critical) raise; raised_now == active; history records both",
+  "request": {
+    "method": "GET",
+    "path": "/admin/alerts",
+    "headers": {
+      "Authorization": "Bearer [set]"
+    },
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "enabled": true,
+      "active": [
+        {
+          "id": "billing_leak",
+          "rule": "billing_leak",
+          "severity": "critical",
+          "title": "Billing-leak signals observed",
+          "detail": {
+            "events_in_window": 1,
+            "window_seconds": 900.0,
+            "by_status": {
+              "402": 1
+            },
+            "models": [
+              "stub-complex"
+            ],
+            "note": "upstream returned a billing status (401/402); check provider credentials and paid-tier exposure"
+          },
+          "first_seen": "[ts]",
+          "last_seen": "[ts]",
+          "state": "active"
+        },
+        {
+          "id": "budget:VK_C",
+          "rule": "budget_threshold",
+          "severity": "critical",
+          "title": "Virtual-key budget exhausted",
+          "detail": {
+            "virtual_key_id": "VK_C",
+            "name": "subscriber-c",
+            "mode": "cost_micros",
+            "period": "total",
+            "used": 36,
+            "limit": 36,
+            "used_ratio": 1.0
+          },
+          "first_seen": "[ts]",
+          "last_seen": "[ts]",
+          "state": "active"
+        }
+      ],
+      "raised_now": [
+        {
+          "id": "budget:VK_C",
+          "rule": "budget_threshold",
+          "severity": "critical",
+          "title": "Virtual-key budget exhausted",
+          "detail": {
+            "virtual_key_id": "VK_C",
+            "name": "subscriber-c",
+            "mode": "cost_micros",
+            "period": "total",
+            "used": 36,
+            "limit": 36,
+            "used_ratio": 1.0
+          },
+          "first_seen": "[ts]",
+          "last_seen": "[ts]",
+          "state": "active"
+        },
+        {
+          "id": "billing_leak",
+          "rule": "billing_leak",
+          "severity": "critical",
+          "title": "Billing-leak signals observed",
+          "detail": {
+            "events_in_window": 1,
+            "window_seconds": 900.0,
+            "by_status": {
+              "402": 1
+            },
+            "models": [
+              "stub-complex"
+            ],
+            "note": "upstream returned a billing status (401/402); check provider credentials and paid-tier exposure"
+          },
+          "first_seen": "[ts]",
+          "last_seen": "[ts]",
+          "state": "active"
+        }
+      ],
+      "cleared_now": [],
+      "history": [
+        {
+          "ts": "[ts]",
+          "event": "raised",
+          "id": "budget:VK_C",
+          "rule": "budget_threshold",
+          "severity": "critical"
+        },
+        {
+          "ts": "[ts]",
+          "event": "raised",
+          "id": "billing_leak",
+          "rule": "billing_leak",
+          "severity": "critical"
+        }
+      ],
+      "config": {
+        "budget_warn_threshold": 0.8,
+        "budget_critical_threshold": 1.0,
+        "billing_leak_window_seconds": 900.0,
+        "rules": {
+          "budget_threshold": true,
+          "pool_exhaustion": false,
+          "circuit_open": false,
+          "billing_leak": true,
+          "ledger_append_failures": true,
+          "ledger_verify": false
+        },
+        "webhook_configured": false,
+        "webhook_timeout_seconds": 2.0,
+        "history_limit": 100
+      },
+      "stats": {
+        "alerts_active": 2,
+        "alerts_raised_total": 2,
+        "alerts_cleared_total": 0,
+        "alerts_webhook_sent_total": 0,
+        "alerts_webhook_failures_total": 0
+      }
+    }
+  },
+  "trace_events": [],
+  "volatile": true,
+  "notes": "vk ids inside alert ids/details mapped to VK_* labels; first_seen/last_seen/history ts scrubbed; stats deterministic (single evaluation so far); webhook unconfigured so webhook counters stay 0"
+}

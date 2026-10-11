@@ -30,6 +30,17 @@
 #     dispatch door
 #   - global-requests (1000/60s) never fires in capture; pacer burst 50 >>
 #     capture traffic so pace waits stay 0
+#
+# Alerting notes (Stage 6):
+#   - budget_threshold + billing_leak + ledger_append_failures are ON and
+#     DETERMINISTIC at snapshot 94 time: VK_C sits exactly at its 36-micros
+#     budget (critical) and scenario 24a injected the single watchdog 402
+#   - pool_exhaustion + circuit_open are OFF for capture determinism only
+#     (cooldown expiry and half-open transitions are timing-dependent);
+#     both rules are unit- and live-tested in tests/test_alerts.py and
+#     tests/test_dashboard.py
+#   - ledger_verify stays off (default); webhook empty — capture never
+#     makes external calls
 
 server:
   host: 127.0.0.1
@@ -68,6 +79,21 @@ cost_guard:
     max_burst: 50
   watchdog:
     statuses: [401, 402]
+
+alerts:
+  enabled: true
+  budget_warn_threshold: 0.8
+  billing_leak_window_seconds: 900
+  rules:
+    budget_threshold: true
+    pool_exhaustion: false
+    circuit_open: false
+    billing_leak: true
+    ledger_append_failures: true
+    ledger_verify: false
+  webhook_url: ""
+  webhook_timeout_seconds: 2.0
+  history_limit: 100
 
 pricing:
   default:

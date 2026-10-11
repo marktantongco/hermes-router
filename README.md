@@ -282,6 +282,35 @@ curl /admin/costguard -H "Authorization: Bearer $ADMIN"
 
 Invalid `cost_guard` configuration refuses startup and hot-reload (fail-closed); an absent section disables the guard with zero behavior change.
 
+### Operations Plane (Stage 6)
+
+**Dashboard** — `GET /dashboard` (admin key, browser): status cards, active alerts, spend by model / key / day, virtual-key budgets with usage bars, a paginated ledger browser (`?page=N`, `?vk=<id>`), pool availability, circuit states, cost-guard summary and the free-tier catalog on one page. `?refresh=30..3600` adds auto-refresh, `?format=json` returns the exact snapshot the page renders. Zero external assets by design — inline CSS, no CDN, no JavaScript — so it renders in air-gapped browsers and can never leak an admin session to a third-party asset host.
+
+**Alerting** — rule-based alerts evaluated on every dashboard/status/alerts call (pull-model: point your uptime checker at `/admin/status` and that poll *is* the alert heartbeat):
+
+| Rule | Fires when | Severity |
+|---|---|---|
+| `budget_threshold` | a virtual-key budget is ≥ 80% consumed (warning) or exhausted/blocked (critical) | warning / critical |
+| `pool_exhaustion` | a pool has keys but none available | critical |
+| `circuit_open` | a circuit breaker is open | warning |
+| `billing_leak` | upstream 401/402 observed within the leak window | critical |
+| `ledger_append_failures` | ledger writes have failed since boot | critical |
+| `ledger_verify` (opt-in, default off) | the hash chain fails verification — O(n) scan, cached by record count | critical |
+
+Transitions fire an optional `webhook_url` exactly once per raise/clear (`{"event": "raised", "alert": {...}}`), fail-soft — delivery failures are counted in `/metrics` and never break a request. Verify the pipe with `POST /admin/alerts/test`.
+
+```yaml
+alerts:
+  enabled: true
+  budget_warn_threshold: 0.8
+  billing_leak_window_seconds: 900
+  rules: {budget_threshold: true, pool_exhaustion: true, circuit_open: true,
+          billing_leak: true, ledger_append_failures: true, ledger_verify: false}
+  webhook_url: ""              # optional http(s) target
+```
+
+**Runbook** — day-2 operations (deploy, key rotation, pool unlock, budget changes, backup/restore, ledger-tamper incidents, alert triage, failure drills) are documented in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
+
 ### Circuit Breaker
 
 ```yaml
@@ -348,6 +377,10 @@ persona:
 | `/admin/ledger/records` | GET | Required | Recent cost records; `?virtual_key_id=` filters per subscriber (Stage 4) |
 | `/admin/ledger/summary` | GET | Required | Aggregate spend: `?group_by=model\|key\|session\|day` (Stage 4) |
 | `/admin/costguard` | GET | Required | Cost-guard snapshot: limiters, window loads, pacer, watchdog, reconciliation (Stage 5) |
+| `/dashboard` | GET | Required | Operations dashboard: status, spend, budgets, ledger browser, alerts — `?format=json`, `?page=N`, `?vk=`, `?refresh=` (Stage 6) |
+| `/admin/status` | GET | Required | Light JSON status for monitoring polls; each poll drives alert evaluation (Stage 6) |
+| `/admin/alerts` | GET | Required | Evaluate alert rules now: active alerts, history, config echo (Stage 6) |
+| `/admin/alerts/test` | POST | Required | Push a synthetic event through the webhook pipe (Stage 6) |
 | `/circuits` | GET | Required | List all circuit breaker states |
 | `/circuits/reset` | POST | Required | Reset all circuit breakers to closed |
 | `/classifier/report` | GET | Required | Surrogate coverage, confidence distribution, routing stats, drift timeline. `?format=html` for dark-themed dashboard |
@@ -422,24 +455,12 @@ docker run -d --name hermes-router --restart unless-stopped \
 
 ### Docker Compose
 
-```yaml
-# docker-compose.yaml
-services:
-  router-proxy:
-    image: hermes-router:latest
-    build: .
-    container_name: hermes-router
-    restart: unless-stopped
-    ports:
-      - "8766:8766"
-    env_file:
-      - /root/.hermes/.env
-    volumes:
-      - ./router_config.yaml:/app/router_config.yaml:ro
-```
+The repo ships a hardened compose profile (`docker-compose.yaml`): loopback-only port mapping (`127.0.0.1:8766:8766` — widen explicitly if you mean to), 512 MB / 1 CPU caps with swap disabled, a stdlib `/health` healthcheck, `no-new-privileges`, all capabilities dropped, a read-only rootfs, size-capped logs, and a named `router-state` volume so the ledger, keystore and traces survive redeploys.
 
 ```bash
+docker compose config    # validate (structure also pinned by tests/test_deploy.py)
 docker compose up -d
+curl -fsS localhost:8766/health
 ```
 
 > **Note:** The default image comes with `router_config.example.yaml` as the config. Mount your real `router_config.yaml` to override. The env file needs the API keys and optionally `ROUTER_PROXY_API_KEY` for auth, `CORS_ORIGINS` for CORS, and `LOG_FORMAT` for JSON logging.
@@ -493,6 +514,8 @@ A cron job runs `refit_surrogate.sh` weekly — reads traces, refits the surroga
 ---
 
 ## Monitoring
+
+Start with the operations dashboard (`GET /dashboard`, admin key) and the [runbook](docs/RUNBOOK.md); the alerting heartbeat pattern (poll `/admin/status`) is documented there.
 
 ### Plain text (default)
 

@@ -1,18 +1,56 @@
+# Stage 6 operations profile — hardened single-service deployment.
+# Blueprint adapted from the incident-tuned deployment patterns audited in
+# the ecosystem dossier (pselamy/hermes-infra, ADAPT: compose healthchecks,
+# resource caps, localhost binding, env secrets — code taken from none).
+#
+# Contract (pinned by tests/test_deploy.py):
+#   * loopback-only port mapping by default (Stage 1 posture) — change the
+#     left side to "8766:8766" only if you really want LAN exposure
+#   * resource caps: 512 MB RAM (no swap), 1.0 CPU
+#   * stdlib healthcheck against /health (no httpx dependency in the probe)
+#   * least privilege: no-new-privileges, all capabilities dropped,
+#     read-only rootfs, writable only via tmpfs + the state volume
+#   * state (.router: ledger db, keystore, traces) survives redeploys
+#     via the named volume; logs are size-capped
+#
+# Validate on a docker host:  docker compose config && docker compose up -d
+# Then:                       curl -fsS localhost:8766/health
+
 services:
   router-proxy:
     build: .
     image: hermes-router:latest
     container_name: hermes-router
+    init: true                      # PID 1 zombie reaping
     restart: unless-stopped
     ports:
-      - "8766:8766"
+      - "127.0.0.1:8766:8766"       # host loopback only (Stage 1 posture)
     env_file:
-      - /root/.hermes/.env          # Shared env with API keys
+      - /root/.hermes/.env          # provider keys + ROUTER_KEY (secrets)
     volumes:
-      - ./router_config.yaml:/app/router_config.yaml:ro   # Mount your real config
+      - ./router_config.yaml:/app/router_config.yaml:ro
+      - router-state:/app/.router   # ledger + keystore + traces persist
+    read_only: true                 # rootfs immutable; writes land below
+    tmpfs:
+      - /tmp                        # python/uvicorn scratch
+    cap_drop:
+      - ALL                         # port 8766 > 1024 needs no capability
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    memswap_limit: 512m             # equal to mem_limit = no swap
+    cpus: "1.0"
     healthcheck:
-      test: ["CMD", "python3", "-c", "import httpx; r = httpx.get('http://localhost:8766/health', timeout=5); r.raise_for_status()"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8766/health', timeout=5)"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 5s
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  router-state:

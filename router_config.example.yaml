@@ -308,3 +308,51 @@ cost_guard:
     max_burst: 20
   watchdog:
     statuses: [401, 402]
+
+# ── Stage 6: alerting (operations plane) ─────────────────────────────────
+# Rule-based alerting over the gateway's own surfaces, plus the operations
+# dashboard (GET /dashboard, admin key — status cards, spend by model/key/
+# day, virtual-key budgets, a paginated ledger browser, pool/circuit state).
+# An absent section disables alerting (the dashboard still renders).
+#
+# Rules (each independently toggleable; unknown names refuse startup):
+#   budget_threshold       warning at >= budget_warn_threshold of a virtual
+#                          key's budget used, critical at >= critical (or
+#                          already blocked 402)
+#   pool_exhaustion        critical when a pool has keys but none available
+#   circuit_open           warning per open circuit breaker
+#   billing_leak           critical on cost-guard watchdog events (401/402)
+#                          within billing_leak_window_seconds
+#   ledger_append_failures critical when ledger appends have failed (billing
+#                          visibility loss since boot)
+#   ledger_verify          critical when the hash chain fails verification.
+#                          DEFAULT OFF: full-chain O(n) scan per evaluation,
+#                          cached until the record count changes
+#
+# Evaluation is pull-model: every GET /dashboard, /admin/status or
+# /admin/alerts call evaluates all rules; transitions (raised / cleared)
+# fire the webhook exactly once each. Poll /admin/status from your uptime
+# checker to drive both the alerts and webhook delivery.
+#
+#   webhook_url            optional http(s) endpoint; POSTs
+#                          {event: raised|cleared|test, alert: {...}}
+#                          fail-soft (delivery never breaks a request;
+#                          failures counted in /metrics)
+#
+# Introspect live at GET /admin/alerts; pipe check POST /admin/alerts/test.
+# Invalid configuration refuses startup / hot-reload (fail-closed).
+alerts:
+  enabled: true
+  budget_warn_threshold: 0.8      # warn at 80% of a budget consumed
+  budget_critical_threshold: 1.0  # critical at 100% (or blocked)
+  billing_leak_window_seconds: 900
+  rules:
+    budget_threshold: true
+    pool_exhaustion: true
+    circuit_open: true
+    billing_leak: true
+    ledger_append_failures: true
+    ledger_verify: false          # opt-in: O(n) chain scan per evaluation
+  webhook_url: ""                 # e.g. https://hooks.example.com/router
+  webhook_timeout_seconds: 3.0
+  history_limit: 100

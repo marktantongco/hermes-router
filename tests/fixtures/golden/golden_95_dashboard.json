@@ -1,0 +1,35 @@
+{
+  "name": "golden_95_dashboard",
+  "description": "GET /dashboard — admin HTML ops page; structure-only snapshot (title + section ids + zero-asset contract)",
+  "request": {
+    "method": "GET",
+    "path": "/dashboard",
+    "headers": {
+      "Authorization": "Bearer [set]"
+    },
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "content_type": "text/html; charset=utf-8",
+      "title": "Hermes Router — Operations Dashboard",
+      "section_ids": [
+        "alerts",
+        "status",
+        "spend",
+        "budgets",
+        "ledger",
+        "pools",
+        "circuits",
+        "costguard",
+        "catalog"
+      ],
+      "has_scripts": false,
+      "has_refresh_meta": false
+    }
+  },
+  "trace_events": [],
+  "volatile": true,
+  "notes": "Section ids are the deep-link contract (operators and fixture asserts depend on them); uptime/generated_at/spend values are volatile so only structure is recorded; zero external assets by design"
+}

@@ -61,6 +61,8 @@ def test_fixture_suite_is_present():
         "golden_91_metrics",
         "golden_92_admin_pools",
         "golden_93_admin_costguard",
+        "golden_94_admin_alerts",
+        "golden_95_dashboard",
     ]:
         assert required in names, f"missing fixture: {required}"
 
@@ -596,3 +598,74 @@ def test_93_admin_costguard_contract():
     # no secret material on the snapshot
     raw = json.dumps(body)
     assert "poolkey" not in raw and "api_key" not in raw
+
+
+# ── Stage 6: operations plane contracts ─────────────────────────────────────
+
+def test_94_admin_alerts_contract():
+    """First alert evaluation is fully deterministic for the pinned
+    scenario order: budget:VK_C (36/36 cost_micros) and billing_leak (the
+    single injected 402) both raise as critical; raised_now mirrors
+    active; webhook counters stay 0 (unconfigured)."""
+    d = _load("golden_94_admin_alerts")
+    body = d["response"]["body"]
+    assert d["response"]["status"] == 200
+    assert body["enabled"] is True
+    active = {a["id"]: a for a in body["active"]}
+    assert set(active) == {"billing_leak", "budget:VK_C"}
+    assert all(a["severity"] == "critical" for a in active.values())
+    # raised_now == active on first evaluation, both timestamps scrubbed
+    assert {a["id"] for a in body["raised_now"]} == set(active)
+    assert body["cleared_now"] == []
+    for alert in body["active"] + body["raised_now"]:
+        assert alert["first_seen"] == "[ts]"
+        assert alert["last_seen"] == "[ts]"
+    # budget detail: VK_C exactly at its 36-micros total budget
+    budget = active["budget:VK_C"]
+    assert budget["rule"] == "budget_threshold"
+    assert budget["detail"]["virtual_key_id"] == "VK_C"
+    assert budget["detail"]["used"] == 36
+    assert budget["detail"]["limit"] == 36
+    assert budget["detail"]["mode"] == "cost_micros"
+    assert budget["detail"]["used_ratio"] == 1.0
+    # leak detail: the single scenario-24a event
+    leak = active["billing_leak"]
+    assert leak["detail"]["events_in_window"] == 1
+    assert leak["detail"]["by_status"] == {"402": 1}
+    assert leak["detail"]["models"] == ["stub-complex"]
+    # history ring records both raises (ts scrubbed)
+    events = [(h["event"], h["id"]) for h in body["history"]]
+    assert sorted(events) == [("raised", "billing_leak"),
+                              ("raised", "budget:VK_C")]
+    # config echo: deterministic rules, no webhook
+    cfg = body["config"]
+    assert cfg["budget_warn_threshold"] == 0.8
+    assert cfg["rules"]["pool_exhaustion"] is False   # capture determinism
+    assert cfg["rules"]["circuit_open"] is False      # capture determinism
+    assert cfg["rules"]["budget_threshold"] is True
+    assert cfg["rules"]["billing_leak"] is True
+    assert cfg["webhook_configured"] is False
+    # stats: single evaluation, no webhook traffic
+    assert body["stats"] == {"alerts_active": 2, "alerts_raised_total": 2,
+                             "alerts_cleared_total": 0,
+                             "alerts_webhook_sent_total": 0,
+                             "alerts_webhook_failures_total": 0}
+    # no raw vk ids survive the scrub
+    raw = json.dumps(body)
+    assert "vk-" not in raw
+
+
+def test_95_dashboard_contract():
+    """The dashboard page shape is the contract: HTML content type, the
+    nine stable section ids, and the zero-external-assets rule (no
+    scripts, no auto-refresh meta by default)."""
+    d = _load("golden_95_dashboard")
+    body = d["response"]["body"]
+    assert d["response"]["status"] == 200
+    assert body["content_type"].startswith("text/html")
+    assert body["title"] == "Hermes Router — Operations Dashboard"
+    assert body["section_ids"] == [
+        "alerts", "status", "spend", "budgets", "ledger",
+        "pools", "circuits", "costguard", "catalog"]
+    assert body["has_scripts"] is False
+    assert body["has_refresh_meta"] is False

@@ -70,7 +70,7 @@ import httpx
 import yaml
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 # Shared model classes — needed so joblib can deserialize embedding-based pipelines
 from surrogate_models import SentenceTransformerVectorizer  # noqa: F401
@@ -156,6 +156,12 @@ except ImportError:  # costguard unavailable -> guard off, proxy unaffected
         pass
     def build_cost_guard(cfg):  # type: ignore[misc,no-redef]
         return None
+
+# ── Operations plane (Stage 6) — alerting + dashboard ────────────────────
+# First-party modules on the runtime file list (same contract as
+# providers.py): a missing file is a boot failure, not a degraded mode.
+from alerts import RULE_NAMES, AlertsError, build_alerts, webhook_payload
+from dashboard import PAGE_SIZE, page_count, render_dashboard
 
 # ── Zero-shot embedding classifier (optional, no LLM needed) ──────────────
 try:
@@ -1421,6 +1427,263 @@ def _cg_abandon(cg_ticket: Any) -> None:
 
 _COST_GUARD: Any = None  # costguard.CostGuard | None (Stage 5)
 
+# ── Stage 6: operations plane ───────────────────────────────────────────────
+_ALERTS: Any = None        # alerts.AlertEngine | None
+_BOOT_TS = time.time()     # uptime anchor for the dashboard/status surfaces
+_LEDGER_VERIFY_CACHE: dict[str, Any] | None = None  # {count, result}
+
+
+def _stage6_bootstrap(cfg: dict) -> list[str]:
+    """Build the alert engine; returns fatal errors (empty == ok).
+
+    All-or-nothing like the other stage bootstraps: a rejected candidate
+    config leaves the previous engine live. An absent/disabled section
+    clears the engine and its state (reload path). The dashboard itself
+    is config-free and always mounted at GET /dashboard.
+    """
+    global _ALERTS, _LEDGER_VERIFY_CACHE
+    try:
+        engine = build_alerts(cfg)
+    except AlertsError as exc:
+        return [f"alerts: {exc}"]
+    except Exception as exc:  # noqa: BLE001 — bootstrap must be precise
+        return [f"alerts: unexpected {type(exc).__name__}: {exc}"]
+    _ALERTS = engine
+    _LEDGER_VERIFY_CACHE = None  # stale cache must never survive a swap
+    if engine is not None:
+        rules_on = sum(1 for r in RULE_NAMES if engine.rules.get(r, True))
+        log.info("  Alerting: enabled (%d/%d rules on, webhook %s)",
+                 rules_on, len(RULE_NAMES),
+                 "on" if engine.webhook_url else "off")
+    else:
+        log.info("  Alerting: disabled (no alerts section)")
+    return []
+
+
+def _budgets_surface() -> list[dict[str, Any]]:
+    """Per-VK budget facts (evaluate_budget verdicts, secrets-free)."""
+    out: list[dict[str, Any]] = []
+    if _VKEYS is None or _LEDGER is None:
+        return out
+    for row in _VKEYS.list():
+        entry: dict[str, Any] = {
+            "id": row["id"], "name": row["name"],
+            "enabled": row["enabled"],
+            "budget_mode": row["budget_mode"],
+            "budget_limit": row["budget_limit"],
+            "budget_period": row["budget_period"],
+            "used": 0, "blocked": False,
+        }
+        if row["budget_mode"] != "none":
+            verdict = evaluate_budget(_LEDGER, row)
+            entry["used"] = verdict["used"]
+            entry["blocked"] = verdict["blocked"]
+        out.append(entry)
+    return out
+
+
+def _cached_ledger_verify() -> dict[str, Any] | None:
+    """Full-chain verify, cached by record count.
+
+    The scan is O(n) and alert evaluation is pull-model (every dashboard
+    render / status poll); the cache re-runs verification only when the
+    ledger has grown since the last scan. Cleared on every reload.
+    """
+    global _LEDGER_VERIFY_CACHE
+    if _LEDGER is None:
+        return None
+    count = _LEDGER.count()
+    cached = _LEDGER_VERIFY_CACHE
+    if cached is not None and cached["count"] == count:
+        return cached["result"]
+    result = _LEDGER.verify()
+    _LEDGER_VERIFY_CACHE = {"count": count, "result": result}
+    return result
+
+
+def _alert_surfaces() -> dict[str, Any]:
+    """Assemble the plain snapshot the alert engine evaluates (pure data
+    — the engine performs no I/O and holds no gateway handles)."""
+    budgets = [{"id": b["id"], "name": b["name"], "mode": b["budget_mode"],
+                "limit": b["budget_limit"], "period": b["budget_period"],
+                "used": b["used"], "blocked": b["blocked"]}
+               for b in _budgets_surface() if b["budget_mode"] != "none"]
+    pools = [{"name": p["name"], "size": p["size"],
+              "available": p["keys_available"]}
+             for p in (pool.snapshot() for pool in all_pools().values())]
+    circuits = [{"key": key, "state": entry.get("state"),
+                 "failures": entry.get("failures", 0)}
+                for key, entry in CIRCUITS.items()]
+    leak_events: list[dict[str, Any]] = []
+    if _COST_GUARD is not None:
+        report = _COST_GUARD.describe(
+            ledger_enabled=_LEDGER is not None,
+            ledger_appends=METRICS.get("ledger_appends_total", 0))
+        leak_events = list(report.get("watchdog", {}).get("events", []))
+    ledger_verify = None
+    if _ALERTS is not None and _LEDGER is not None \
+            and _ALERTS.rules.get("ledger_verify", False):
+        ledger_verify = _cached_ledger_verify()
+    return {
+        "budgets": budgets,
+        "pools": pools,
+        "circuits": circuits,
+        "billing_leak_events": leak_events,
+        "ledger_append_failures": METRICS.get("ledger_append_failures_total", 0),
+        "ledger_verify": ledger_verify,
+    }
+
+
+def _status_cards(cfg: dict, m: dict[str, int],
+                  pool_snapshots: list[dict[str, Any]]) -> dict[str, int]:
+    """The eight dashboard/status headline counters."""
+    cg_blocks = 0
+    if _COST_GUARD is not None:
+        cg_blocks = int(_COST_GUARD.stats()["cost_guard_blocks_total"])
+    return {
+        "requests": sum(m.get(f"requests_total_{name}", 0)
+                        for name in cfg.get("categories", {})),
+        "errors": m.get("errors_total", 0),
+        "sessions": len(SESSIONS),
+        "circuits_open": sum(1 for c in CIRCUITS.values()
+                              if c.get("state") == "open"),
+        "pools_available": sum(p.get("keys_available", 0)
+                               for p in pool_snapshots),
+        "ledger_records": _LEDGER.count() if _LEDGER is not None else 0,
+        "budget_blocks": m.get("ledger_budget_blocks_total", 0),
+        "cost_guard_blocks": cg_blocks,
+    }
+
+
+def _dispatch_alert_webhooks(result: dict[str, Any]) -> None:
+    """Schedule fail-soft webhook deliveries for this round's transitions."""
+    if _ALERTS is None or not _ALERTS.webhook_url:
+        return
+    events: list[tuple[str, dict[str, Any]]] = []
+    for alert in result.get("raised_now", []):
+        events.append(("raised", alert))
+    for alert in result.get("cleared_now", []):
+        events.append(("cleared", alert))
+    for event, alert in events:
+        payload = webhook_payload(event, alert)
+        asyncio.create_task(_deliver_alert_webhook(payload))
+
+
+async def _deliver_alert_webhook(payload: dict[str, Any]) -> None:
+    """POST one webhook payload; counted, never raised (fail-soft)."""
+    if _ALERTS is None:
+        return
+    url, timeout = _ALERTS.webhook_url, _ALERTS.webhook_timeout
+    ok = False
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(url, json=payload)
+            ok = 200 <= resp.status_code < 300
+            if not ok:
+                log.warning("Alert webhook %s -> HTTP %d", url,
+                            resp.status_code)
+    except Exception as exc:  # noqa: BLE001 — delivery must never break a surface
+        log.warning("Alert webhook delivery failed: %s", exc)
+    _ALERTS.note_webhook_result(ok)
+
+
+def _status_ctx(cfg: dict) -> dict[str, Any]:
+    """Light JSON status for monitoring polls (no spend/ledger pages)."""
+    m = _get_metrics()
+    pools = [pool.snapshot() for pool in all_pools().values()]
+    alerts_result: dict[str, Any] = {"enabled": False}
+    if _ALERTS is not None:
+        alerts_result = _ALERTS.evaluate(_alert_surfaces())
+        _dispatch_alert_webhooks(alerts_result)
+    return {
+        "generated_at": _now_iso(),
+        "uptime_seconds": int(time.time() - _BOOT_TS),
+        "version": app.version,
+        "features": {
+            "billing": _LEDGER is not None,
+            "cost_guard": _COST_GUARD is not None,
+            "alerts": _ALERTS is not None,
+            "pools": bool(pools),
+            "catalog": _CATALOG is not None,
+        },
+        "cards": _status_cards(cfg, m, pools),
+        "alerts": {"enabled": alerts_result.get("enabled", False),
+                   "active": alerts_result.get("active", [])},
+        "pools": [{"name": p["name"], "size": p["size"],
+                   "keys_available": p["keys_available"]} for p in pools],
+        "circuits": [{"key": k, "state": v.get("state"),
+                       "failures": v.get("failures", 0)}
+                      for k, v in CIRCUITS.items()],
+    }
+
+
+def _dashboard_ctx(cfg: dict, *, page: int, vk_filter: str | None,
+                   refresh: int | None) -> dict[str, Any]:
+    """Full snapshot the dashboard renders (HTML) or returns (?format=json)."""
+    m = _get_metrics()
+    pools = [pool.snapshot() for pool in all_pools().values()]
+    budgets = _budgets_surface()
+    for b in budgets:
+        limit = b["budget_limit"]
+        b["used_ratio"] = ((b["used"] / limit)
+                            if (b["budget_mode"] != "none" and limit > 0)
+                            else None)
+    alerts_result: dict[str, Any] = {"enabled": False}
+    if _ALERTS is not None:
+        alerts_result = _ALERTS.evaluate(_alert_surfaces())
+        _dispatch_alert_webhooks(alerts_result)
+    spend: dict[str, Any] = {"by_model": [], "by_key": [], "by_day": []}
+    ledger_block: dict[str, Any] = {"enabled": False}
+    if _LEDGER is not None:
+        spend = {
+            "by_model": _LEDGER.summary("model"),
+            "by_key": _LEDGER.summary("key"),
+            "by_day": list(reversed(_LEDGER.summary("day"))),  # newest first
+        }
+        total = _LEDGER.count(virtual_key_id=vk_filter)
+        pages = page_count(total)
+        page_clamped = max(1, min(page, pages))
+        rows = _LEDGER.records(limit=PAGE_SIZE,
+                               offset=(page_clamped - 1) * PAGE_SIZE,
+                               virtual_key_id=vk_filter)
+        ledger_block = {
+            "enabled": True, "total": total, "page": page_clamped,
+            "pages": pages, "page_size": PAGE_SIZE, "rows": rows,
+            "vk_filter": vk_filter,
+        }
+    cost_guard_block: dict[str, Any] = {"enabled": False}
+    if _COST_GUARD is not None:
+        cost_guard_block = _COST_GUARD.describe(
+            ledger_enabled=_LEDGER is not None,
+            ledger_appends=m.get("ledger_appends_total", 0))
+    return {
+        "title": "Hermes Router — Operations Dashboard",
+        "generated_at": _now_iso(),
+        "uptime_seconds": int(time.time() - _BOOT_TS),
+        "version": app.version,
+        "features": {
+            "billing": _LEDGER is not None,
+            "cost_guard": _COST_GUARD is not None,
+            "alerts": _ALERTS is not None,
+            "pools": bool(pools),
+            "catalog": _CATALOG is not None,
+        },
+        "server": {"host": cfg["server"].get("host"),
+                   "port": cfg["server"].get("port")},
+        "cards": _status_cards(cfg, m, pools),
+        "alerts": alerts_result,
+        "spend": spend,
+        "budgets": budgets,
+        "ledger": ledger_block,
+        "pools": pools,
+        "circuits": [{"key": k, "state": v.get("state"),
+                       "failures": v.get("failures", 0)}
+                      for k, v in CIRCUITS.items()],
+        "cost_guard": cost_guard_block,
+        "catalog": _CATALOG.summary() if _CATALOG is not None else None,
+        "query": {"refresh": refresh},
+    }
+
 
 def _stage5_bootstrap(cfg: dict) -> list[str]:
     """Build the cost guard; returns fatal errors (empty == ok).
@@ -2683,6 +2946,12 @@ def _startup() -> None:
     for fatal in _stage5_bootstrap(cfg):
         log.fatal("Refusing to start: %s", fatal)
         sys.exit(1)
+    # Stage 6: alerting (fail-closed; no alerts section = off)
+    for fatal in _stage6_bootstrap(cfg):
+        log.fatal("Refusing to start: %s", fatal)
+        sys.exit(1)
+    log.info("  Dashboard: GET /dashboard (admin key) — status, spend, "
+             "ledger browser, alerts")
     log.info("Router starting on %s:%s", cfg["server"]["host"], cfg["server"]["port"])
     log.info("  Classifier: %s (%s)", cfg["classifier"]["model"], cfg["classifier"]["base_url"])
     cats = cfg.get("categories", {})
@@ -2802,6 +3071,15 @@ async def reload_config(request: Request):
         raise HTTPException(
             status_code=400,
             detail={"error": {"message": "; ".join(stage5_errors), "type": "reload_error"}},
+        )
+
+    # Stage 6: alerting must rebuild before the swap is accepted (same
+    # all-or-nothing guarantee; an absent section clears the engine).
+    stage6_errors = _stage6_bootstrap(new_cfg)
+    if stage6_errors:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"message": "; ".join(stage6_errors), "type": "reload_error"}},
         )
 
     # Clear profile_hint so extraction runs with fresh config
@@ -3450,6 +3728,94 @@ async def ledger_summary(request: Request, group_by: str = "model",
     return {"group_by": group_by, "groups": rows, "count": len(rows)}
 
 
+@app.get("/dashboard")
+async def dashboard_page(request: Request, format: str = "html",
+                         page: int = 1, vk: str | None = None,
+                         refresh: int | None = None):
+    """Stage 6: operations dashboard (admin key required).
+
+    Server-rendered HTML with zero external assets (inline CSS, no CDN,
+    no JavaScript). ``?format=json`` returns the exact snapshot the page
+    renders from. ``?page=N`` paginates the ledger browser, ``?vk=<id>``
+    filters it, ``?refresh=<seconds>`` adds an auto-refresh meta tag
+    (clamped to 5..3600).
+    """
+    verify_auth(request, require_admin=True)
+    cfg = request.app.state.config
+    refresh_clamped = None
+    if refresh is not None:
+        refresh_clamped = max(5, min(3600, refresh))
+    vk_filter = (vk or "").strip() or None
+    ctx = _dashboard_ctx(cfg, page=max(1, page), vk_filter=vk_filter,
+                         refresh=refresh_clamped)
+    if format == "json":
+        return JSONResponse(content=ctx)
+    return HTMLResponse(content=render_dashboard(ctx))
+
+
+@app.get("/admin/status")
+async def admin_status(request: Request):
+    """Stage 6: light JSON status for monitoring polls (admin key).
+
+    Deliberately cheap: headline counters, feature flags, active alerts,
+    pool/circuit state — no spend aggregation, no ledger pages. Polling
+    this endpoint also drives alert evaluation (and therefore webhook
+    delivery) — see the runbook's heartbeat pattern.
+    """
+    verify_auth(request, require_admin=True)
+    cfg = request.app.state.config
+    return JSONResponse(content=_status_ctx(cfg))
+
+
+@app.get("/admin/alerts")
+async def alerts_status(request: Request):
+    """Stage 6: evaluate alert rules now; active + history + config echo.
+
+    Evaluation is pull-model (deterministic for the current state); each
+    call also fires webhook deliveries for any transitions it observes.
+    """
+    verify_auth(request, require_admin=True)
+    if _ALERTS is None:
+        return {"enabled": False}
+    result = _ALERTS.evaluate(_alert_surfaces())
+    _dispatch_alert_webhooks(result)
+    return result
+
+
+@app.post("/admin/alerts/test")
+async def alerts_test(request: Request):
+    """Stage 6: deliver a synthetic event through the configured webhook
+    and report the outcome (operator pipe check; admin key)."""
+    verify_auth(request, require_admin=True)
+    if _ALERTS is None:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": {"message": "Alerting disabled (no alerts section)",
+                              "type": "alerts_disabled"}},
+        )
+    if not _ALERTS.webhook_url:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": {"message": "No webhook_url configured",
+                              "type": "webhook_not_configured"}},
+        )
+    payload = webhook_payload("test", {
+        "id": "test", "rule": "manual", "severity": "info",
+        "title": "Operator webhook test", "detail": {},
+        "first_seen": None, "last_seen": None})
+    delivered, status_code, error = False, None, None
+    try:
+        async with httpx.AsyncClient(timeout=_ALERTS.webhook_timeout) as client:
+            resp = await client.post(_ALERTS.webhook_url, json=payload)
+            status_code = resp.status_code
+            delivered = 200 <= resp.status_code < 300
+    except Exception as exc:  # noqa: BLE001 — report, never crash
+        error = f"{type(exc).__name__}: {exc}"
+    _ALERTS.note_webhook_result(delivered)
+    return {"delivered": delivered, "status_code": status_code,
+            "error": error}
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """OpenAI-compatible chat completions — routed automatically."""
@@ -3669,6 +4035,28 @@ async def metrics(request: Request):
             "# TYPE hermes_router_cost_guard_estimate_drift_tokens_total counter",
             f"hermes_router_cost_guard_estimate_drift_tokens_total {cg['cost_guard_estimate_drift_tokens_total']}",
         ]
+    # Stage 6: alerting counters (engine = single source, like the guard;
+    # section present only while the engine is enabled)
+    if _ALERTS is not None:
+        al = _ALERTS.stats()
+        m.update(al)
+        lines += [
+            "# HELP hermes_router_alerts_active Currently active alerts",
+            "# TYPE hermes_router_alerts_active gauge",
+            f"hermes_router_alerts_active {al['alerts_active']}",
+            "# HELP hermes_router_alerts_raised_total Alerts raised since boot",
+            "# TYPE hermes_router_alerts_raised_total counter",
+            f"hermes_router_alerts_raised_total {al['alerts_raised_total']}",
+            "# HELP hermes_router_alerts_cleared_total Alerts cleared since boot",
+            "# TYPE hermes_router_alerts_cleared_total counter",
+            f"hermes_router_alerts_cleared_total {al['alerts_cleared_total']}",
+            "# HELP hermes_router_alerts_webhook_sent_total Alert webhook deliveries succeeded",
+            "# TYPE hermes_router_alerts_webhook_sent_total counter",
+            f"hermes_router_alerts_webhook_sent_total {al['alerts_webhook_sent_total']}",
+            "# HELP hermes_router_alerts_webhook_failures_total Alert webhook deliveries failed",
+            "# TYPE hermes_router_alerts_webhook_failures_total counter",
+            f"hermes_router_alerts_webhook_failures_total {al['alerts_webhook_failures_total']}",
+        ]
     return JSONResponse(
         content={"metrics": m, "prometheus": "\n".join(lines)},
     )
@@ -3705,6 +4093,11 @@ if __name__ == "__main__":
     # Stage 5: cost guard must build before the socket binds.
     for s5_err in _stage5_bootstrap(cfg):
         log.fatal("Refusing to start: %s", s5_err)
+        sys.exit(1)
+
+    # Stage 6: alerting must build before the socket binds.
+    for s6_err in _stage6_bootstrap(cfg):
+        log.fatal("Refusing to start: %s", s6_err)
         sys.exit(1)
 
     # Stage 1: localhost is the default bind. Environment overrides exist for
