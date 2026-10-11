@@ -1,0 +1,84 @@
+{
+  "name": "golden_16_pool_exhausted",
+  "description": "all pooled keys cooling -> synthetic 429 -> route-level fallback succeeds",
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "Authorization": "Bearer golden-test-key-0001"
+    },
+    "body": {
+      "model": "auto",
+      "messages": [
+        {
+          "role": "user",
+          "content": "/use:pooled_exhaust pooled exhaustion please"
+        }
+      ],
+      "stream": false
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "id": "chatcmpl-stub-golden",
+      "object": "chat.completion",
+      "created": 1727000000,
+      "model": "stub-fallback",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Stub response for golden fixture."
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 5,
+        "completion_tokens": 6,
+        "total_tokens": 11
+      },
+      "hermes_router": {
+        "fallback_used": true
+      }
+    }
+  },
+  "trace_events": [
+    {
+      "event": "key_rotation",
+      "tier": "pooled_exhaust",
+      "reason": "pool_429_cooldown",
+      "from_key_id": "exhaust_pool/key-c",
+      "base_url": "<stub>"
+    },
+    {
+      "event": "key_rotation",
+      "tier": "pooled_exhaust",
+      "reason": "pool_429_cooldown",
+      "from_key_id": "exhaust_pool/key-d",
+      "base_url": "<stub>"
+    },
+    {
+      "event": "route",
+      "tier": "pooled_exhaust",
+      "model": "stub-simple",
+      "upstream_status": 429,
+      "stream": false,
+      "fallback_level": 1,
+      "fallback_model": "stub-fallback",
+      "provider": "openai"
+    },
+    {
+      "event": "route",
+      "tier": "pooled_exhaust",
+      "model": "stub-fallback",
+      "upstream_status": 200,
+      "stream": false,
+      "provider": "openai"
+    }
+  ],
+  "volatile": false,
+  "notes": "pool exhaustion engages the existing fallback cascade; fallback_used=true"
+}

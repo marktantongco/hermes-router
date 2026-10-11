@@ -1,4 +1,4 @@
-# Golden-fixture router config (Stage 1 posture).
+# Golden-fixture router config (Stage 1 posture, Stage 3 pools).
 # Used by tools/capture_golden.py to drive the hardened server against a
 # deterministic stub upstream. Captures current behavior as the baseline
 # contract for Stage 2+ contract tests.
@@ -8,6 +8,11 @@
 #     fixtures 08/09 record the 401 path
 #   - classifier tier disabled via /use: overrides in every scenario
 #     (classifier endpoint points at the stub but is never called)
+#
+# Pool notes (Stage 3):
+#   - three disjoint pools so each pool scenario starts at a fresh RR pointer
+#   - the stub rate-limits poolkey-aaaa/cccc/dddd/eeee with retry-after: 1
+#   - require_capabilities [fast] exercises the capability filter path
 
 server:
   host: 127.0.0.1
@@ -32,6 +37,32 @@ routing:
   override_prefix: '/use:'
   escalation_keywords: []
   de_escalation_keywords: []
+
+key_pools:
+  rotate_pool:
+    default_cooldown_seconds: 1
+    max_cooldown_seconds: 5
+    keys:
+      - ref: GOLDEN_POOL_KEY_A
+        label: key-a
+        capabilities: [fast]
+      - ref: GOLDEN_POOL_KEY_B
+        label: key-b
+        capabilities: [fast, deep]
+  exhaust_pool:
+    default_cooldown_seconds: 1
+    keys:
+      - ref: GOLDEN_POOL_KEY_C
+        label: key-c
+      - ref: GOLDEN_POOL_KEY_D
+        label: key-d
+  stream_pool:
+    default_cooldown_seconds: 1
+    keys:
+      - ref: GOLDEN_POOL_KEY_E
+        label: key-e
+      - ref: GOLDEN_POOL_KEY_F
+        label: key-f
 
 categories:
   simple:
@@ -60,3 +91,25 @@ categories:
     fallback_base_url: http://127.0.0.1:9901/v1
     fallback_provider: openai
     fallback_key_env: ''
+  pooled:
+    label: Pooled rotation tier
+    model: stub-simple
+    base_url: http://127.0.0.1:9901/v1
+    key_pool: rotate_pool
+    require_capabilities: [fast]
+    timeout_seconds: 20
+  pooled_exhaust:
+    label: Pooled exhaustion tier
+    model: stub-simple
+    base_url: http://127.0.0.1:9901/v1
+    key_pool: exhaust_pool
+    timeout_seconds: 20
+    fallback_model: stub-fallback
+    fallback_base_url: http://127.0.0.1:9901/v1
+    fallback_key_env: ''
+  pooled_stream:
+    label: Pooled streaming tier
+    model: stub-simple
+    base_url: http://127.0.0.1:9901/v1
+    key_pool: stream_pool
+    timeout_seconds: 20

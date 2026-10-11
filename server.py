@@ -96,6 +96,36 @@ from providers import (
     validate_provider_config,
 )
 
+# ── Key pooling (Stage 3) — 429-aware rotation + capability tags ───────────
+try:
+    from keypool import PoolError, all_pools, build_pools, get_pool, register_pools
+except ImportError:  # keypool unavailable -> single-key behavior only
+    class PoolError(RuntimeError):  # type: ignore[misc,no-redef]
+        pass
+    def all_pools():  # type: ignore[misc,no-redef]
+        return {}
+    def build_pools(cfg):  # type: ignore[misc,no-redef]
+        return {}
+    def get_pool(name):  # type: ignore[misc,no-redef]
+        raise PoolError("keypool module unavailable")
+    def register_pools(pools):  # type: ignore[misc,no-redef]
+        return None
+
+# ── Free-tier catalog (Stage 3) — data-driven provider facts + refresh ─────
+try:
+    from catalog import (
+        CatalogError,
+        build_catalog_from_cfg,
+        ingest_catalog_refs,
+    )
+except ImportError:  # catalog unavailable -> no-op
+    class CatalogError(RuntimeError):  # type: ignore[misc,no-redef]
+        pass
+    def build_catalog_from_cfg(cfg):  # type: ignore[misc,no-redef]
+        return None
+    def ingest_catalog_refs(cfg, store):  # type: ignore[misc,no-redef]
+        return []
+
 # ── Zero-shot embedding classifier (optional, no LLM needed) ──────────────
 try:
     from zero_shot_classifier import get_zero_shot
@@ -1107,14 +1137,115 @@ async def _post_with_retry(
         raise
 
 
+async def _post_with_503_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    json: dict,
+    headers: dict,
+    timeout: httpx.Timeout,
+    label: str,
+) -> httpx.Response:
+    """POST with the 503 overload-retry policy (2s, 4s, 8s backoff).
+
+    Behavior-identical to the pre-Stage-3 inline loop (golden fixtures pin
+    it): transient transport errors become a synthetic 503 so the caller's
+    fallback logic engages; 503s are retried up to 3 times before the final
+    503 is returned as-is.
+    """
+    _503_retries = 3
+    _503_backoff = [2.0, 4.0, 8.0]
+    resp: httpx.Response = httpx.Response(503, text="No response received")
+    resp._request = httpx.Request("POST", url)
+    for attempt_503 in range(_503_retries):
+        try:
+            resp = await _post_with_retry(
+                url, json=json, headers=headers,
+                timeout=timeout,
+                label=label,
+                client=client,
+            )
+        except Exception as exc:
+            log.warning("Transport error for %s: %s", label, exc)
+            # Let caller handle fallback — don't retry transport-level here
+            r = httpx.Response(503, text=str(exc))
+            r._request = httpx.Request("POST", url)
+            return r
+
+        if resp.status_code != 503:
+            return resp
+
+        if attempt_503 < _503_retries - 1:
+            delay = _503_backoff[attempt_503]
+            err_brief = resp.text[:150] if resp.text else ""
+            log.warning(
+                "HTTP 503 for %s (attempt %s/%s) — backing off %.1fs: %s",
+                label, attempt_503 + 1, _503_retries, delay, err_brief,
+            )
+            await asyncio.sleep(delay)
+        else:
+            err_brief = resp.text[:150] if resp.text else ""
+            log.error(
+                "HTTP 503 exhausted %s retries for %s: %s",
+                _503_retries, label, err_brief,
+            )
+    return resp
+
+
+def _pool_cfg_of(model_cfg: dict) -> tuple[Any, frozenset[str]]:
+    """Resolve the (pool, required-capabilities) pair for a model config.
+
+    Returns (None, frozenset()) when the entry is single-key (key_pool not
+    set). Raises PoolError when a configured pool is not registered
+    (fail-closed — synthetic 502 upstream so the cascade advances).
+    """
+    pool_name = str(model_cfg.get("key_pool") or "").strip()
+    if not pool_name:
+        return None, frozenset()
+    require = frozenset(
+        str(c) for c in (model_cfg.get("require_capabilities") or []))
+    return get_pool(pool_name), require
+
+
+def _translate_ok(
+    provider: Any, resp: httpx.Response, request_payload: dict, model_cfg: dict,
+) -> httpx.Response:
+    """Stage 2 translation tail: provider-native 200 -> OpenAI shape.
+
+    Untranslatable bodies become 502 so the fallback cascade can engage
+    (previously a malformed 200 raised a raw 500 with no fallback path).
+    Preserves the pool key-id attribution through the synthetic response.
+    """
+    if resp.status_code != 200:
+        return resp
+    try:
+        translated = provider.translate_response(
+            resp.json(), request_payload, model_cfg)
+    except Exception as exc:
+        log.error("Response translation failed for %s: %s", model_cfg["model"], exc)
+        r = httpx.Response(502, text=f"response translation failed: {exc}")
+        r._request = resp.request
+        return r
+    out = httpx.Response(200, json=translated, request=resp.request)
+    key_id = getattr(resp, "_hermes_key_id", None)
+    if key_id:
+        out._hermes_key_id = key_id  # type: ignore[attr-defined]  # pool attribution
+    return out
+
+
 async def call_model(
     cfg: dict, model_cfg: dict, request_payload: dict
 ) -> httpx.Response:
-    """Call an OpenAI-compatible endpoint. Returns the httpx response.
+    """Call a model endpoint through its provider adapter. Returns the httpx response.
 
     Circuit breaker: checks if the endpoint circuit is open before calling.
-    Key rotation: if the primary key returns HTTP 429 (rate-limited),
-    retries with alternate_key_env before giving up.
+    Key rotation:
+      * single-key entries (api_key_env): HTTP 429 retries once with
+        alternate_key_env before giving up (pre-Stage-3 behavior, pinned by
+        the golden fixtures);
+      * pooled entries (key_pool, Stage 3): round-robin over available keys,
+        each 429 puts the used key into a Retry-After-derived cooldown and
+        the next key is tried; 401/403 quarantine the key.
     503 retry: HTTP 503 (overloaded) retries up to 3x with exponential backoff
     (2s, 4s, 8s) so transient overloads are resolved before escalation.
     Uses _post_with_retry for transient transport error resilience.
@@ -1133,18 +1264,102 @@ async def call_model(
 
     base_url = model_cfg["base_url"].rstrip("/")
     url = provider.build_url(model_cfg)
+    tier = model_cfg.get("tier", "unknown")
 
     # Circuit breaker check (keyed per base_url+model so one 503 model doesn't block others on same host)
     if _circuit_is_open(cfg, base_url, model_name):
         log.warning("Circuit open for %s — skipping call", base_url)
-        _inc_metric_tier(model_cfg.get("tier", "unknown"), "429")
+        _inc_metric_tier(tier, "429")
         _inc_metric("429_total")
         r = httpx.Response(503, text="Circuit breaker open")
         r._request = httpx.Request("POST", url)
         return r
 
-    api_key = env_key(model_cfg["api_key_env"])
+    # Stage 3: resolve the key pool (fail-closed on unknown pool refs).
+    try:
+        pool, require = _pool_cfg_of(model_cfg)
+    except PoolError as exc:
+        log.error("Key pool resolution failed for %s: %s", model_name, exc)
+        r = httpx.Response(502, text=str(exc))
+        r._request = httpx.Request("POST", "gateway://keypool")
+        return r
+
     timeout = model_cfg.get("timeout_seconds", 120)
+
+    # ── Pooled dispatch (Stage 3) ───────────────────────────────────────────
+    if pool is not None:
+        # Request translation is key-independent; only auth headers rotate.
+        payload = provider.translate_request(request_payload, model_cfg)
+        resp: httpx.Response | None = None
+        async with httpx.AsyncClient() as client:
+            # One attempt per key at most: every 429 cools its key, so the
+            # pool makes forward progress by construction.
+            for _ in range(pool.size):
+                try:
+                    lease = pool.acquire(require)
+                except PoolError as exc:
+                    log.error("Key acquire failed for %s: %s", model_name, exc)
+                    r = httpx.Response(502, text=str(exc))
+                    r._request = httpx.Request("POST", "gateway://keypool")
+                    return r
+                if lease is None:
+                    break
+                _inc_metric("pool_requests_total")
+                headers = provider.build_headers(lease.api_key)
+                resp = await _post_with_503_retry(
+                    client, url, json=payload, headers=headers,
+                    timeout=httpx.Timeout(timeout),
+                    label=f"call_model({model_name})",
+                )
+                if resp.status_code in (401, 403):
+                    pool.report_result(lease.key_id, resp.status_code)
+                    _inc_metric("pool_auth_failures_total")
+                    trace_key_rotation(
+                        base_url=base_url, tier=tier,
+                        reason="pool_auth_failure", from_key_id=lease.key_id,
+                    )
+                    continue
+                if resp.status_code == 429:
+                    pool.report_result(lease.key_id, 429, headers=resp.headers)
+                    _circuit_record_failure(cfg, base_url, model_name)
+                    _inc_metric_tier(tier, "429")
+                    _inc_metric("429_total")
+                    _inc_metric("pool_429_total")
+                    _inc_metric("pool_rotations_total")
+                    trace_key_rotation(
+                        base_url=base_url, tier=tier,
+                        reason="pool_429_cooldown", from_key_id=lease.key_id,
+                    )
+                    continue
+                pool.report_result(lease.key_id, resp.status_code)
+                resp._hermes_key_id = lease.key_id  # type: ignore[attr-defined]  # pool attribution
+                break
+
+        if resp is None:
+            # Pool exhausted before any key could be tried — engage the
+            # route-level fallback cascade with a synthetic 429.
+            _inc_metric("pool_exhausted_total")
+            _inc_metric_tier(tier, "429")
+            _inc_metric("429_total")
+            r = httpx.Response(429, json={
+                "error": {
+                    "message": f"Key pool '{pool.name}' exhausted "
+                               "(all keys cooling down or disabled)",
+                    "type": "pool_exhausted",
+                }})
+            r._request = httpx.Request("POST", url)
+            return r
+
+        # Circuit + session retry-state tracking on the FINAL outcome.
+        if resp.status_code == 200:
+            _circuit_record_success(cfg, base_url, model_name)
+            _clear_retry(session_key(request_payload.get("messages", [])) or "")
+        elif resp.status_code in (502, 503, 504, 529):  # 529 = Anthropic overloaded
+            _circuit_record_failure(cfg, base_url, model_name)
+        return _translate_ok(provider, resp, request_payload, model_cfg)
+
+    # ── Single-key dispatch (pre-Stage-3 behavior, fixture-pinned) ─────────
+    api_key = env_key(model_cfg.get("api_key_env", ""))
     alt_key = env_key(model_cfg.get("alternate_key_env", ""))
 
     # Stage 2: provider-native request assembly (translation + auth headers)
@@ -1153,48 +1368,16 @@ async def call_model(
     headers = built.headers
 
     async with httpx.AsyncClient() as client:
-        # ── 503 retry: exponential backoff (2s, 4s, 8s) ──────────────────────────
-        _503_retries = 3
-        _503_backoff = [2.0, 4.0, 8.0]
-        resp: httpx.Response = httpx.Response(503, text="No response received")
-        resp._request = httpx.Request("POST", url)
-        for attempt_503 in range(_503_retries):
-            try:
-                resp = await _post_with_retry(
-                    url, json=payload, headers=headers,
-                    timeout=httpx.Timeout(timeout),
-                    label=f"call_model({model_name})",
-                    client=client,
-                )
-            except Exception as exc:
-                log.warning("Transport error for %s: %s", model_cfg["model"], exc)
-                # Let caller handle fallback — don't retry transport-level here
-                r = httpx.Response(503, text=str(exc))
-                r._request = httpx.Request("POST", url)
-                return r
-
-            if resp.status_code != 503:
-                break
-
-            if attempt_503 < _503_retries - 1:
-                delay = _503_backoff[attempt_503]
-                err_brief = resp.text[:150] if resp.text else ""
-                log.warning(
-                    "HTTP 503 for %s (attempt %s/%s) — backing off %.1fs: %s",
-                    model_cfg["model"], attempt_503 + 1, _503_retries, delay, err_brief,
-                )
-                await asyncio.sleep(delay)
-            else:
-                err_brief = resp.text[:150] if resp.text else ""
-                log.error(
-                    "HTTP 503 exhausted %s retries for %s: %s",
-                    _503_retries, model_cfg["model"], err_brief,
-                )
+        resp = await _post_with_503_retry(
+            client, url, json=payload, headers=headers,
+            timeout=httpx.Timeout(timeout),
+            label=f"call_model({model_name})",
+        )
 
         # Circuit + metric tracking
         if resp.status_code == 429:
             _circuit_record_failure(cfg, base_url, model_name)
-            _inc_metric_tier(model_cfg.get("tier", "unknown"), "429")
+            _inc_metric_tier(tier, "429")
             _inc_metric("429_total")
         elif resp.status_code in (502, 503, 504, 529):  # 529 = Anthropic overloaded
             _circuit_record_failure(cfg, base_url, model_name)
@@ -1207,7 +1390,7 @@ async def call_model(
             log.warning("Primary key rate-limited (429) - switching to alternate key")
             trace_key_rotation(
                 base_url=base_url,
-                tier=model_cfg.get("tier", "unknown"),
+                tier=tier,
                 reason="429_rate_limit",
             )
             try:
@@ -1221,7 +1404,7 @@ async def call_model(
                 log.warning("Alternate key request failed for %s: %s", model_name, exc)
             if resp.status_code == 429:
                 _circuit_record_failure(cfg, base_url, model_name)
-                _inc_metric_tier(model_cfg.get("tier", "unknown"), "429")
+                _inc_metric_tier(tier, "429")
                 _inc_metric("429_total")
                 log.warning("Alternate key also rate-limited for %s", model_name)
             elif resp.status_code == 200:
@@ -1230,20 +1413,7 @@ async def call_model(
                 _clear_retry(session_key(request_payload.get("messages", [])) or "")
 
     # Stage 2: translate provider-native success bodies to the OpenAI shape.
-    # Untranslatable bodies become 502 so the fallback cascade can engage
-    # (previously a malformed 200 raised a raw 500 with no fallback path).
-    if resp.status_code == 200:
-        try:
-            translated = provider.translate_response(
-                resp.json(), request_payload, model_cfg)
-        except Exception as exc:
-            log.error("Response translation failed for %s: %s", model_name, exc)
-            r = httpx.Response(502, text=f"response translation failed: {exc}")
-            r._request = resp.request
-            return r
-        return httpx.Response(200, json=translated, request=resp.request)
-
-    return resp
+    return _translate_ok(provider, resp, request_payload, model_cfg)
 
 
 # ── Retry-tracking: count consecutive primary failures per session.
@@ -1381,6 +1551,9 @@ async def route_request_stream(cfg: dict, payload: dict):
             "base_url": model_cfg["fallback_base_url"],
             "api_key_env": model_cfg.get("fallback_key_env", ""),
             "alternate_key_env": model_cfg.get("fallback_alternate_key_env", ""),
+            # Stage 3: fallbacks may use their own key pool
+            "key_pool": model_cfg.get("fallback_key_pool", ""),
+            "require_capabilities": model_cfg.get("fallback_require_capabilities") or [],
             "timeout_seconds": model_cfg.get("timeout_seconds", 120),
             "tier": category,
         }
@@ -1394,6 +1567,8 @@ async def route_request_stream(cfg: dict, payload: dict):
             "base_url": model_cfg["fallback2_base_url"],
             "api_key_env": model_cfg.get("fallback2_key_env", ""),
             "alternate_key_env": model_cfg.get("fallback2_alternate_key_env", ""),
+            "key_pool": model_cfg.get("fallback2_key_pool", ""),
+            "require_capabilities": model_cfg.get("fallback2_require_capabilities") or [],
             "timeout_seconds": model_cfg.get("timeout_seconds", 120),
             "tier": category,
         }
@@ -1424,7 +1599,30 @@ async def route_request_stream(cfg: dict, payload: dict):
                 _inc_metric_tier(category, "429")
                 continue  # try next tier
 
-            api_key = env_key(attempt_cfg["api_key_env"])
+            # Stage 3: pooled tiers resolve their key candidates up-front
+            pool: Any = None
+            leases: list[Any] = []
+            if str(attempt_cfg.get("key_pool") or "").strip():
+                try:
+                    pool = get_pool(str(attempt_cfg["key_pool"]).strip())
+                    leases = pool.acquire_all(frozenset(
+                        str(c) for c in (attempt_cfg.get("require_capabilities") or [])))
+                except PoolError as exc:
+                    log.error("Key pool resolution failed for %s: %s", model_name, exc)
+                    continue  # try next tier (fail-closed)
+                if not leases:
+                    _inc_metric("pool_exhausted_total")
+                    log.warning("Pool %s exhausted for streaming %s — next tier",
+                                attempt_cfg["key_pool"], model_name)
+                    trace_route(
+                        session_key=key, tier=category, model=model_name,
+                        upstream_status=429, stream=True,
+                        fallback_level=attempt_idx + 1,
+                        provider=provider.name,
+                    )
+                    continue  # try next tier
+
+            api_key = env_key(attempt_cfg.get("api_key_env", ""))
             alt_key = env_key(attempt_cfg.get("alternate_key_env", ""))
             timeout = attempt_cfg.get("timeout_seconds", 120)
             # Stage 2: provider-native request assembly
@@ -1433,14 +1631,19 @@ async def route_request_stream(cfg: dict, payload: dict):
             stream_payload = stream_built.json
             headers = stream_built.headers
 
-            # ── Key rotation: if primary key gets 429, try alternate ────
-            key_attempts: list[tuple[str | None, str]] = (
-                [(api_key, "primary_key")] if api_key else [(None, "no_key")]
-            )
-            if alt_key:
-                key_attempts.append((alt_key, "alternate_key"))
+            # ── Key rotation candidates: pool leases or single/alt key ──
+            key_attempts: list[tuple[str | None, str]]
+            if pool is not None:
+                key_attempts = [(lease.api_key, lease.key_id) for lease in leases]
+            else:
+                key_attempts = (
+                    [(api_key, "primary_key")] if api_key else [(None, "no_key")]
+                )
+                if alt_key:
+                    key_attempts.append((alt_key, "alternate_key"))
 
-            for key_val, key_label in key_attempts:
+            for key_idx, (key_val, key_label) in enumerate(key_attempts):
+                has_more_keys = key_idx + 1 < len(key_attempts)
                 if key_val:
                     headers = provider.build_headers(key_val)
 
@@ -1458,6 +1661,26 @@ async def route_request_stream(cfg: dict, payload: dict):
                             _circuit_record_failure(cfg, base_url, model_name)
                             _inc_metric_tier(category, "429")
                             _inc_metric("429_total")
+
+                            if pool is not None:
+                                # Stage 3: cool the used key, rotate to the next lease
+                                pool.report_result(key_label, 429, headers=resp.headers)
+                                _inc_metric("pool_429_total")
+                                _inc_metric("pool_rotations_total")
+                                trace_key_rotation(
+                                    base_url=base_url, tier=category,
+                                    reason="pool_429_cooldown_stream",
+                                    from_key_id=key_label,
+                                )
+                                if has_more_keys:
+                                    continue  # try next pooled key
+                                trace_route(
+                                    session_key=key, tier=category, model=model_name,
+                                    upstream_status=429, stream=True,
+                                    fallback_level=attempt_idx + 1,
+                                    provider=provider.name,
+                                )
+                                break
 
                             if key_label == "primary_key" and alt_key:
                                 trace_key_rotation(
@@ -1478,6 +1701,25 @@ async def route_request_stream(cfg: dict, payload: dict):
                             err_body = await resp.aread()
                             err_text = err_body.decode(errors="replace")[:300]
 
+                            # Stage 3: quarantine pooled keys on auth failures
+                            if pool is not None and resp.status_code in (401, 403):
+                                pool.report_result(key_label, resp.status_code)
+                                _inc_metric("pool_auth_failures_total")
+                                trace_key_rotation(
+                                    base_url=base_url, tier=category,
+                                    reason="pool_auth_failure_stream",
+                                    from_key_id=key_label,
+                                )
+                                if has_more_keys:
+                                    continue  # try next pooled key
+                                trace_route(
+                                    session_key=key, tier=category, model=model_name,
+                                    upstream_status=resp.status_code, stream=True,
+                                    fallback_level=attempt_idx + 1,
+                                    provider=provider.name,
+                                )
+                                break
+
                             # 503 retry with backoff before falling to next tier
                             if resp.status_code == 503:
                                 for retry_i, backoff in enumerate([2.0, 4.0, 8.0]):
@@ -1496,10 +1738,13 @@ async def route_request_stream(cfg: dict, payload: dict):
                                             if retry_resp.status_code == 200:
                                                 log.info("Streaming %s OK after 503 retry %d", model_name, retry_i + 2)
                                                 _circuit_record_success(cfg, base_url, model_name)
+                                                if pool is not None:
+                                                    pool.report_result(key_label, 200)
                                                 trace_route(
                                                     session_key=key, tier=category, model=model_name,
                                                     upstream_status=200, stream=True,
                                                     provider=provider.name,
+                                                    key_id=key_label if pool is not None else None,
                                                 )
                                                 if attempt_label != "primary":
                                                     _inc_metric("fallback_used_total" if attempt_label == "fallback1" else "fallback2_used_total")
@@ -1522,6 +1767,9 @@ async def route_request_stream(cfg: dict, payload: dict):
                                                 _ = await retry_resp.aread()
                                                 # 429 on retry — record and break to next key/tier
                                                 _circuit_record_failure(cfg, base_url, model_name)
+                                                if pool is not None:
+                                                    pool.report_result(key_label, 429,
+                                                                       headers=retry_resp.headers)
                                                 break
                                             # Non-200, non-429 — continue retrying
                                             err_body = await retry_resp.aread()
@@ -1544,10 +1792,13 @@ async def route_request_stream(cfg: dict, payload: dict):
                         log.info("Streaming %s OK (key=%s)", model_name, key_label)
                         # Bug #13: Record circuit success for any successful key, not just alternate
                         _circuit_record_success(cfg, base_url, model_name)
+                        if pool is not None:
+                            pool.report_result(key_label, 200)
                         trace_route(
                             session_key=key, tier=category, model=model_name,
                             upstream_status=200, stream=True,
                             provider=provider.name,
+                            key_id=key_label if pool is not None else None,
                         )
                         if attempt_label != "primary":
                             _inc_metric("fallback_used_total" if attempt_label == "fallback1" else "fallback2_used_total")
@@ -1704,6 +1955,7 @@ async def route_request(cfg: dict, payload: dict) -> JSONResponse:
                 session_key=key, tier=category, model=cat_cfg["model"],
                 upstream_status=200, stream=False,
                 provider=provider_name(cat_cfg),
+                key_id=getattr(resp, "_hermes_key_id", None),
             )
             _clear_retry(key)
             data = resp.json()
@@ -1735,8 +1987,11 @@ async def route_request(cfg: dict, payload: dict) -> JSONResponse:
     fb_cfg = {
         "model": fallback_model,
         "base_url": cat_cfg["fallback_base_url"],
-        "api_key_env": cat_cfg["fallback_key_env"],
+        "api_key_env": cat_cfg.get("fallback_key_env", ""),
         "alternate_key_env": cat_cfg.get("fallback_alternate_key_env", ""),
+        # Stage 3: fallbacks may use their own key pool
+        "key_pool": cat_cfg.get("fallback_key_pool", ""),
+        "require_capabilities": cat_cfg.get("fallback_require_capabilities") or [],
         "timeout_seconds": cat_cfg.get("timeout_seconds", 120),
         "tier": category,
         # Stage 2: fallbacks may cross protocols; default inherits primary
@@ -1752,6 +2007,7 @@ async def route_request(cfg: dict, payload: dict) -> JSONResponse:
             session_key=key, tier=category, model=fallback_model,
             upstream_status=200, stream=False,
             provider=provider_name(fb_cfg),
+            key_id=getattr(fb_resp, "_hermes_key_id", None),
         )
         return JSONResponse(content=data)
 
@@ -1772,8 +2028,10 @@ async def route_request(cfg: dict, payload: dict) -> JSONResponse:
         fb2_cfg = {
             "model": fb2_model,
             "base_url": cat_cfg["fallback2_base_url"],
-            "api_key_env": cat_cfg["fallback2_key_env"],
+            "api_key_env": cat_cfg.get("fallback2_key_env", ""),
             "alternate_key_env": cat_cfg.get("fallback2_alternate_key_env", ""),
+            "key_pool": cat_cfg.get("fallback2_key_pool", ""),
+            "require_capabilities": cat_cfg.get("fallback2_require_capabilities") or [],
             "timeout_seconds": cat_cfg.get("timeout_seconds", 120),
             "tier": category,
             # Stage 2: fallbacks may cross protocols; default inherits primary
@@ -1788,6 +2046,7 @@ async def route_request(cfg: dict, payload: dict) -> JSONResponse:
                 session_key=key, tier=category, model=fb2_model,
                 upstream_status=200, stream=False,
                 provider=provider_name(fb2_cfg),
+                key_id=getattr(fb2_resp, "_hermes_key_id", None),
             )
             return JSONResponse(content=data)
         return _proxy_error(fb2_resp)
@@ -1906,6 +2165,92 @@ else:
     log.info("CORS disabled (CORS_ORIGINS unset) — same-origin only")
 
 
+# ── Stage 3: pool + catalog lifecycle ────────────────────────────────────────
+
+_CATALOG: Any = None                      # CatalogStore | None
+_CATALOG_TASK: asyncio.Task | None = None  # background refresh job
+
+
+async def _catalog_refresh_loop() -> None:
+    """Background catalog refresh (only scheduled when refresh_seconds > 0).
+
+    Failures keep the last-good document live (atomic swap in the store);
+    every failure is counted so the metrics surface shows drift.
+    """
+    while True:
+        await asyncio.sleep(_CATALOG.refresh_seconds)  # type: ignore[union-attr]
+        try:
+            _CATALOG.refresh()  # type: ignore[union-attr]
+            _inc_metric("catalog_refresh_success_total")
+        except CatalogError as exc:
+            _inc_metric("catalog_refresh_failures_total")
+            _CATALOG.last_refresh_error = str(exc)  # type: ignore[union-attr]
+            log.warning("Catalog refresh failed (last-good kept): %s", exc)
+        except Exception as exc:  # defensive: the job must never die
+            _inc_metric("catalog_refresh_failures_total")
+            log.warning("Catalog refresh crashed (last-good kept): %s", exc)
+
+
+def _stop_catalog_task() -> None:
+    global _CATALOG_TASK
+    if _CATALOG_TASK is not None and not _CATALOG_TASK.done():
+        _CATALOG_TASK.cancel()
+    _CATALOG_TASK = None
+
+
+def _stage3_bootstrap(cfg: dict) -> list[str]:
+    """Build the catalog store + key pools; returns fatal errors (empty == ok).
+
+    Validation completes BEFORE any global mutation: a rejected reload
+    leaves the previous catalog and pool registry live (all-or-nothing).
+    Order matters: catalog refs are ingested into the candidate config
+    BEFORE pool construction so a category may inherit base_url/provider
+    facts and still reference pools.
+    """
+    errors: list[str] = []
+
+    # 1. Catalog (optional section — absent keeps everything off)
+    try:
+        store = build_catalog_from_cfg(cfg)
+        if store is not None:
+            store.load()
+    except CatalogError as exc:
+        return [f"catalog: {exc}"]
+
+    # 2. Ingest catalog references into the candidate config (explicit wins)
+    errors.extend(ingest_catalog_refs(cfg, store))
+
+    # 3. Pool construction (validates internally, fail-closed)
+    try:
+        pools = build_pools(cfg)
+    except PoolError as exc:
+        errors.append(f"key_pools: {exc}")
+        return errors
+    if errors:
+        return errors
+
+    # ── Commit phase: globals mutate only after full validation ──
+    global _CATALOG
+    _CATALOG = store
+    register_pools(pools)
+    for name, pool in pools.items():
+        log.info("  Key pool %s: %d keys [%s]", name, pool.size, pool.strategy)
+
+    # 4. Background refresh job (restart cleanly on reload). At pre-flight
+    # (main block) no event loop exists yet; uvicorn's startup hook re-runs
+    # this bootstrap inside the loop and schedules the job there.
+    _stop_catalog_task()
+    if store is not None and store.refresh_seconds > 0:
+        try:
+            _CATALOG_TASK = asyncio.ensure_future(_catalog_refresh_loop())
+            log.info("  Catalog refresh job: every %.0fs (%s)",
+                     store.refresh_seconds, "remote" if store.url else "file")
+        except RuntimeError:  # no running loop (pre-flight) — startup schedules it
+            log.info("  Catalog refresh job: scheduled at app startup (%.0fs)",
+                     store.refresh_seconds)
+    return errors
+
+
 @app.on_event("startup")
 def _startup() -> None:
     # Note: deprecated in FastAPI 0.93+ but functional.
@@ -1915,6 +2260,10 @@ def _startup() -> None:
     if provider_errors:
         for p_err in provider_errors:
             log.fatal("Refusing to start: %s", p_err)
+        sys.exit(1)
+    # Stage 3: pools + catalog (fail-closed)
+    for fatal in _stage3_bootstrap(cfg):
+        log.fatal("Refusing to start: %s", fatal)
         sys.exit(1)
     log.info("Router starting on %s:%s", cfg["server"]["host"], cfg["server"]["port"])
     log.info("  Classifier: %s (%s)", cfg["classifier"]["model"], cfg["classifier"]["base_url"])
@@ -2007,6 +2356,16 @@ async def reload_config(request: Request):
         raise HTTPException(
             status_code=400,
             detail={"error": {"message": "; ".join(provider_errors), "type": "reload_error"}},
+        )
+
+    # Stage 3: pools + catalog must build before the swap is accepted.
+    # Bootstrap is all-or-nothing — on error the previous pools/catalog
+    # stay live and the candidate config is discarded.
+    stage3_errors = _stage3_bootstrap(new_cfg)
+    if stage3_errors:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"message": "; ".join(stage3_errors), "type": "reload_error"}},
         )
 
     # Clear profile_hint so extraction runs with fresh config
@@ -2424,6 +2783,72 @@ async def list_providers(request: Request):
     }
 
 
+@app.get("/admin/pools")
+async def list_pools(request: Request):
+    """Stage 3: key pool state — availability, cooldowns, per-key counters.
+
+    Metadata only: key references are shown by kind (env/keystore), never
+    by value. Cooldown remaining fields are volatile by nature.
+    """
+    verify_auth(request)
+    pools = [pool.snapshot() for pool in all_pools().values()]
+    return {"pools": pools, "count": len(pools)}
+
+
+@app.post("/admin/pools/{name}/unlock")
+async def unlock_pool(name: str, request: Request):
+    """Stage 3: clear quarantine + cooldowns on one pool (operator action)."""
+    verify_auth(request)
+    try:
+        pool = get_pool(name)
+    except PoolError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": {"message": str(exc), "type": "pool_error"}},
+        ) from exc
+    reset = pool.unlock()
+    log.info("Pool %s unlocked by operator: %d keys reset", name, reset)
+    return {"status": "unlocked", "pool": name, "keys_reset": reset}
+
+
+@app.get("/admin/catalog")
+async def get_catalog(request: Request):
+    """Stage 3: free-tier catalog summary (provider facts + limits)."""
+    verify_auth(request)
+    if _CATALOG is None:
+        return {"catalog": None, "note": "no catalog section configured"}
+    return {"catalog": _CATALOG.summary()}
+
+
+@app.post("/admin/catalog/refresh")
+async def refresh_catalog(request: Request):
+    """Stage 3: force a catalog refresh (file re-read or remote pull).
+
+    Last-good document stays live on failure; the error is returned for
+    operator visibility and counted in the metrics.
+    """
+    verify_auth(request)
+    if _CATALOG is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": {"message": "No catalog configured",
+                              "type": "catalog_error"}},
+        )
+    try:
+        summary = _CATALOG.refresh()
+        _inc_metric("catalog_refresh_success_total")
+    except CatalogError as exc:
+        _inc_metric("catalog_refresh_failures_total")
+        _CATALOG.last_refresh_error = str(exc)
+        raise HTTPException(
+            status_code=502,
+            detail={"error": {"message": f"Catalog refresh failed: {exc}",
+                              "type": "catalog_error"}},
+        ) from exc
+    return {"status": "refreshed", **{k: v for k, v in summary.items()
+                                      if k != "providers"}}
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """OpenAI-compatible chat completions — routed automatically."""
@@ -2504,6 +2929,34 @@ async def metrics(request: Request):
         "# TYPE hermes_router_circuits_open gauge",
         f"hermes_router_circuits_open {sum(1 for c in CIRCUITS.values() if c.get('state') == 'open')}",
     ]
+
+    # Stage 3: key pool counters + per-pool availability gauges
+    lines += [
+        "",
+        "# HELP hermes_router_pool_requests_total Pooled key acquisition attempts",
+        "# TYPE hermes_router_pool_requests_total counter",
+        f"hermes_router_pool_requests_total {m.get('pool_requests_total', 0)}",
+        "# HELP hermes_router_pool_429_total Pooled keys rate-limited (429)",
+        "# TYPE hermes_router_pool_429_total counter",
+        f"hermes_router_pool_429_total {m.get('pool_429_total', 0)}",
+        "# HELP hermes_router_pool_rotations_total In-request rotations to the next pooled key",
+        "# TYPE hermes_router_pool_rotations_total counter",
+        f"hermes_router_pool_rotations_total {m.get('pool_rotations_total', 0)}",
+        "# HELP hermes_router_pool_auth_failures_total Pooled keys quarantined/cooled on 401/403",
+        "# TYPE hermes_router_pool_auth_failures_total counter",
+        f"hermes_router_pool_auth_failures_total {m.get('pool_auth_failures_total', 0)}",
+        "# HELP hermes_router_pool_exhausted_total Requests finding no available pooled key",
+        "# TYPE hermes_router_pool_exhausted_total counter",
+        f"hermes_router_pool_exhausted_total {m.get('pool_exhausted_total', 0)}",
+        "",
+        "# HELP hermes_router_pool_keys_available Pooled keys currently usable",
+        "# TYPE hermes_router_pool_keys_available gauge",
+    ]
+    for pool in all_pools().values():
+        now = pool.snapshot()
+        lines.append(
+            f'hermes_router_pool_keys_available{{pool="{pool.name}"}} {now["keys_available"]}')
+    lines += [""]
     return JSONResponse(
         content={"metrics": m, "prometheus": "\n".join(lines)},
     )
@@ -2525,6 +2978,11 @@ if __name__ == "__main__":
     if provider_errors:
         for p_err in provider_errors:
             log.fatal("Refusing to start: %s", p_err)
+        sys.exit(1)
+
+    # Stage 3: pools + catalog must build before the socket binds.
+    for s3_err in _stage3_bootstrap(cfg):
+        log.fatal("Refusing to start: %s", s3_err)
         sys.exit(1)
 
     # Stage 1: localhost is the default bind. Environment overrides exist for

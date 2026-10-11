@@ -33,8 +33,12 @@ def test_fixture_suite_is_present():
         "golden_07_multimodal",
         "golden_08_unauthorized_no_token",
         "golden_09_unauthorized_wrong_token",
+        "golden_15_pool_rotation",
+        "golden_16_pool_exhausted",
+        "golden_17_pool_stream_rotation",
         "golden_90_health",
         "golden_91_metrics",
+        "golden_92_admin_pools",
     ]:
         assert required in names, f"missing fixture: {required}"
 
@@ -254,3 +258,89 @@ def test_90_health_open_and_91_metrics_protected():
     assert m["response"]["status"] == 200          # captured WITH credentials
     assert m["request"]["headers"].get("Authorization") == "Bearer [set]"
     assert "requests_total" in m["response"]["body"]["metric_keys"]
+
+
+# ── Stage 3 key-pool contracts ───────────────────────────────────────────
+
+def test_15_pool_rotation_contract():
+    """429 on key-a cools it; the pool rotates; key-b serves the request."""
+    d = _load("golden_15_pool_rotation")
+    body = d["response"]["body"]
+    assert d["response"]["status"] == 200
+    assert body["model"] == "stub-simple"
+    assert body["id"] == "chatcmpl-stub-golden"  # openai producer: no annotation
+    assert "hermes_router" not in body
+    events = d["trace_events"]
+    assert [e["event"] for e in events] == ["key_rotation", "route"]
+    rot = events[0]
+    assert rot["reason"] == "pool_429_cooldown"
+    assert rot["from_key_id"] == "rotate_pool/key-a"
+    assert rot["tier"] == "pooled"
+    route = events[1]
+    assert route["upstream_status"] == 200
+    assert route["key_id"] == "rotate_pool/key-b"  # served by the healthy key
+
+
+def test_16_pool_exhausted_contract():
+    """All pooled keys 429 -> synthetic 429 -> route-level fallback succeeds."""
+    d = _load("golden_16_pool_exhausted")
+    body = d["response"]["body"]
+    assert d["response"]["status"] == 200
+    assert body["model"] == "stub-fallback"
+    assert body["hermes_router"]["fallback_used"] is True
+    events = d["trace_events"]
+    assert [e["event"] for e in events] == [
+        "key_rotation", "key_rotation", "route", "route"]
+    # both pool keys cooled with header-derived reasons
+    assert [e["from_key_id"] for e in events[:2]] == [
+        "exhaust_pool/key-c", "exhaust_pool/key-d"]
+    assert all(e["reason"] == "pool_429_cooldown" for e in events[:2])
+    # synthetic exhaustion engages the cascade at route level
+    assert events[2]["upstream_status"] == 429
+    assert events[2]["fallback_level"] == 1
+    assert events[3]["upstream_status"] == 200
+    assert events[3]["model"] == "stub-fallback"
+
+
+def test_17_pool_stream_rotation_contract():
+    """Streaming through a pool: first key 429s (circuit opens at 3rd
+    consecutive failure incl. scenario 16), second key streams, circuit
+    re-closes on success."""
+    d = _load("golden_17_pool_stream_rotation")
+    sse = d["response"]["body"]
+    assert d["response"]["status"] == 200
+    assert sse[-1] == "data: [DONE]"
+    assert sum(1 for chunk in sse if '"delta"' in chunk) >= 3
+    events = d["trace_events"]
+    assert [e["event"] for e in events] == [
+        "circuit", "key_rotation", "circuit", "route"]
+    assert events[0] == {"event": "circuit", "old_state": "closed",
+                         "new_state": "open", "base_url": "<stub>"}
+    assert events[1]["reason"] == "pool_429_cooldown_stream"
+    assert events[1]["from_key_id"] == "stream_pool/key-e"
+    assert events[2]["old_state"] == "open" and events[2]["new_state"] == "closed"
+    assert events[3]["upstream_status"] == 200
+    assert events[3]["stream"] is True
+    assert events[3]["key_id"] == "stream_pool/key-f"
+
+
+def test_92_admin_pools_contract():
+    """Pool state after 15-17: counters deterministic, secrets absent."""
+    d = _load("golden_92_admin_pools")
+    body = d["response"]["body"]
+    assert d["response"]["status"] == 200
+    assert body["count"] == 3
+    pools = {p["name"]: p for p in body["pools"]}
+    assert set(pools) == {"rotate_pool", "exhaust_pool", "stream_pool"}
+    assert all(p["strategy"] == "round_robin" and p["size"] == 2
+               for p in pools.values())
+    keys = {k["label"]: k for p in pools.values() for k in p["keys"]}
+    assert keys["key-a"]["total_429"] == 1 and keys["key-a"]["total_success"] == 0
+    assert keys["key-b"]["total_success"] == 1
+    assert keys["key-c"]["total_429"] == 1 and keys["key-d"]["total_429"] == 1
+    assert keys["key-e"]["total_429"] == 1 and keys["key-f"]["total_success"] == 1
+    assert keys["key-a"]["consecutive_429"] == 1
+    assert not any(k["disabled"] for k in keys.values())
+    # no secret material anywhere in the admin surface
+    assert "api_key" not in json.dumps(body) and "secret" not in json.dumps(body)
+    assert all("ref" not in k for k in keys.values())

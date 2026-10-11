@@ -33,7 +33,8 @@
       "tier": "simple",
       "model": "stub-simple",
       "upstream_status": 200,
-      "stream": true
+      "stream": true,
+      "provider": "openai"
     }
   ],
   "volatile": false,

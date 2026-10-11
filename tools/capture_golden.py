@@ -56,11 +56,23 @@ AUTH_HEADER = f"Bearer {GOLDEN_ROUTER_KEY}"
 FIXED_CREATED = 1727000000
 FIXED_BODY = "Stub response for golden fixture."
 
+# Stage 3: pool scenarios use dedicated throwaway key values; the stub
+# rate-limits a deterministic subset so rotation is reproducible.
+POOL_KEY_A = "poolkey-aaaa"   # rotate_pool key-a: always 429 (retry-after: 1)
+POOL_KEY_B = "poolkey-bbbb"   # rotate_pool key-b: healthy
+POOL_KEY_C = "poolkey-cccc"   # exhaust_pool key-c: always 429
+POOL_KEY_D = "poolkey-dddd"   # exhaust_pool key-d: always 429
+POOL_KEY_E = "poolkey-eeee"   # stream_pool key-e: always 429
+POOL_KEY_F = "poolkey-ffff"   # stream_pool key-f: healthy
+POOL_429_KEYS = {POOL_KEY_A, POOL_KEY_C, POOL_KEY_D, POOL_KEY_E}
+
 RUNTIME_FILES = [
     "server.py",
     "providers.py",
     "trace.py",
     "keystore.py",
+    "keypool.py",
+    "catalog.py",
     "surrogate_models.py",
     "zero_shot_classifier.py",
     "fasttext_classifier.py",
@@ -109,6 +121,16 @@ def build_stub_app() -> FastAPI:
     async def completions(request: Request):
         payload = await request.json()
         model = payload.get("model", "stub-unknown")
+
+        # Stage 3: deterministic per-key behavior for pool scenarios
+        auth = request.headers.get("authorization", "")
+        if auth.startswith("Bearer ") and auth[7:] in POOL_429_KEYS:
+            return JSONResponse(
+                {"error": {"message": "stub rate limited", "type": "rate_limit_error"}},
+                status_code=429,
+                headers={"retry-after": "1"},
+            )
+
         last_user = ""
         for m in reversed(payload.get("messages", [])):
             if m.get("role") == "user":
@@ -239,7 +261,7 @@ def normalize_trace(records: list[dict]) -> list[dict]:
         "event", "tier", "model", "upstream_status", "stream",
         "fallback_level", "fallback_model", "direction", "reason",
         "old_state", "new_state", "failure_count", "max_failures",
-        "provider",
+        "provider", "key_id", "from_key_id",
     ]
     out = []
     for r in records:
@@ -269,6 +291,10 @@ def run_scenarios(client: httpx.Client, trace_path: Path) -> list[dict]:
                trace_key: str | None = None, notes: str = "",
                volatile: bool = False, trace_offset: int = 0,
                request_headers: dict | None = None) -> None:
+        # Session-less event types (no session_key field) that still belong
+        # to THIS request when they appear inside the offset slice. The
+        # slice bounds them: capture requests are strictly sequential.
+        sessionless = {"key_rotation", "circuit"}
         events: list[dict] = []
         if trace_key:
             # Only events appended by THIS request (file is append-only;
@@ -276,6 +302,8 @@ def run_scenarios(client: httpx.Client, trace_path: Path) -> list[dict]:
             events = normalize_trace([
                 json.loads(line) for line in trace_lines()[trace_offset:]
                 if json.loads(line).get("session_key") == trace_key
+                or (json.loads(line).get("event") in sessionless
+                    and "session_key" not in json.loads(line))
             ])
         fixtures.append({
             "name": name,
@@ -408,6 +436,49 @@ def run_scenarios(client: httpx.Client, trace_path: Path) -> list[dict]:
            notes="Registry content is static; category resolution follows the fixture config",
            request_headers={"Authorization": "Bearer [set]"})
 
+    # 15 — Stage 3: pooled rotation — key-a 429 (retry-after: 1) -> key-b 200
+    post_chat("golden_15_pool_rotation",
+              "pool rotates to the next key on 429; served by the healthy key",
+              [user_msg("/use:pooled pooled rotation please")],
+              notes="key_rotation event carries from_key_id; route event carries serving key_id")
+
+    # 16 — Stage 3: pooled exhaustion — both keys 429 -> synthetic 429 -> fallback 200
+    post_chat("golden_16_pool_exhausted",
+              "all pooled keys cooling -> synthetic 429 -> route-level fallback succeeds",
+              [user_msg("/use:pooled_exhaust pooled exhaustion please")],
+              notes="pool exhaustion engages the existing fallback cascade; fallback_used=true")
+
+    # 17 — Stage 3: pooled streaming rotation — key-e 429 -> key-f streams
+    post_chat("golden_17_pool_stream_rotation",
+              "streaming through a pool: 429 on first key, SSE passthrough via second",
+              [user_msg("/use:pooled_stream pooled stream please")], stream=True,
+              notes="pool_429_cooldown_stream rotation then normal SSE synthesis")
+
+    # 92 — Stage 3: pool state snapshot (deterministic fields only)
+    r = client.get(f"{ROUTER_URL}/admin/pools", headers={"Authorization": AUTH_HEADER})
+    pools_out = []
+    for p in r.json().get("pools", []):
+        pools_out.append({
+            "name": p["name"],
+            "strategy": p["strategy"],
+            "size": p["size"],
+            "keys": [
+                {k: k_meta[k] for k in ("key_id", "label", "capabilities",
+                                        "total_acquired", "total_429",
+                                        "total_success", "total_auth_failures",
+                                        "disabled", "consecutive_429")}
+                for k_meta in sorted(p["keys"], key=lambda k: k["key_id"])
+            ],
+        })
+    record("golden_92_admin_pools",
+           "GET /admin/pools — per-key counters after scenarios 15-17 (cooldowns excluded)",
+           None, "/admin/pools", "GET", r.status_code,
+           {"pools": pools_out, "count": len(pools_out)}, None,
+           notes="Counters are cumulative and deterministic for this scenario order; "
+                 "cooldown/availability fields are volatile and omitted",
+           volatile=True,
+           request_headers={"Authorization": "Bearer [set]"})
+
     return fixtures
 
 
@@ -471,7 +542,10 @@ def main() -> None:
            "TRACE_LOG_DIR": str(trace_dir), "TRACE_LOG_ENABLED": "true",
            "PYTHONUNBUFFERED": "1",
            "HERMES_ROUTER_FIXED_EPOCH": str(FIXED_CREATED),
-           "GOLDEN_ROUTER_KEY": GOLDEN_ROUTER_KEY}
+           "GOLDEN_ROUTER_KEY": GOLDEN_ROUTER_KEY,
+           "GOLDEN_POOL_KEY_A": POOL_KEY_A, "GOLDEN_POOL_KEY_B": POOL_KEY_B,
+           "GOLDEN_POOL_KEY_C": POOL_KEY_C, "GOLDEN_POOL_KEY_D": POOL_KEY_D,
+           "GOLDEN_POOL_KEY_E": POOL_KEY_E, "GOLDEN_POOL_KEY_F": POOL_KEY_F}
     env.update({k: v for k, v in __import__("os").environ.items()
                 if k.startswith(("LC_", "LANG_"))})
     router_log = open(tmp / "router.stderr.log", "w")
@@ -498,6 +572,8 @@ def main() -> None:
                 "All tier selections use /use: overrides (classifier tiers bypassed)",
                 "Volatile fields normalized; see 'volatile' flag per fixture",
                 "Stage 2: trace route events carry provider; scenarios 10-14 exercise adapters",
+                "Stage 3: scenarios 15-17 exercise key-pool rotation/exhaustion/streaming; "
+                "route events carry key_id, key_rotation events carry from_key_id",
                 "Re-capture at every stage boundary; diff = behavior regression signal",
             ],
             "fixtures": [f["name"] for f in fixtures],

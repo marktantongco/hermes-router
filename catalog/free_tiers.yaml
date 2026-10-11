@@ -1,0 +1,174 @@
+# Free-tier provider catalog (Stage 3).
+#
+# Snapshot of the seven free API tiers identified by the dossier audit
+# (2026-09-22): Groq, Cerebras, Mistral, Google Gemini, OpenRouter,
+# SambaNova, and the Nous Research portal free tier for the Hermes home
+# backend. This file is DATA, not code: limits drift, so every entry carries
+# a confidence marker and a source, and the catalog refresh job (see
+# catalog.py + router_config.example.yaml `catalog:` section) re-reads or
+# re-pulls this document without a restart.
+#
+# Schema (validated by catalog.load_catalog, fail-closed):
+#   version: 1
+#   updated: ISO date of the snapshot
+#   providers:
+#     <name>:            lowercase snake_case; ingested via category
+#                        `catalog_ref: <name>`
+#       label:           display name
+#       base_url:        OpenAI-compatible base URL (https)
+#       provider:        adapter registry name (see providers.py /admin/providers)
+#       capabilities:    tags a key pool / category can inherit
+#       limits:          documented free-tier caps (rpm / tpm / rpd as applicable)
+#         confidence:    vendor-docs | community | unverified
+#         source:        where the numbers came from
+#       models:          free-tier-relevant model ids (snapshot; may drift)
+#       signup:          key issuance URL
+#       notes:           operator guidance
+#
+# IMPORTANT: numbers below are a point-in-time snapshot for defaulting and
+# documentation. Stage 5 limiters treat catalog values as defaults that
+# operator config overrides; do not treat them as a compliance guarantee.
+
+version: 1
+updated: "2026-09-22"
+
+providers:
+  groq:
+    label: Groq
+    base_url: https://api.groq.com/openai/v1
+    provider: openai
+    capabilities: [fast]
+    signup: https://console.groq.com/keys
+    limits:
+      rpm: 30
+      tpm: 6000
+      rpd: 14400
+      confidence: vendor-docs
+      source: console.groq.com/docs/rate-limits
+      note: per-model; llama-3.3-70b-versatile class defaults shown
+    models:
+      - llama-3.3-70b-versatile
+      - llama-3.1-8b-instant
+    notes: >
+      OpenAI-compatible endpoint. Free tier is rate-limited per model;
+      pooling several keys rotates 429s well. Retry-After header honored.
+
+  cerebras:
+    label: Cerebras
+    base_url: https://api.cerebras.ai/v1
+    provider: openai
+    capabilities: [fast]
+    signup: https://cloud.cerebras.ai
+    limits:
+      rpm: 30
+      tpm: 60000
+      tokens_per_day: 1000000
+      confidence: vendor-docs
+      source: inference-docs.cerebras.ai/support/pricing
+    models:
+      - llama3.1-8b
+      - llama-3.3-70b
+      - qwen-3-32b
+    notes: >
+      Wafer-scale inference, very high tokens/sec. Free tier keyed by
+      organization; 429s carry standard Retry-After.
+
+  mistral:
+    label: Mistral AI
+    base_url: https://api.mistral.ai/v1
+    provider: openai
+    capabilities: [fast, vision]
+    signup: https://console.mistral.ai
+    limits:
+      rps: 1
+      tpm: 500000
+      tokens_per_month: 1000000000
+      confidence: vendor-docs
+      source: docs.mistral.ai/deployment/laplateforme/tier
+    models:
+      - mistral-small-latest
+      - open-mistral-nemo
+      - pixtral-12b-2409
+    notes: >
+      La Plateforme free experiment tier; 1 request/second steady-state
+      makes single-key pools throttle early — pool multiple keys.
+
+  google_gemini:
+    label: Google Gemini (OpenAI-compatible)
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    provider: openai
+    capabilities: [fast, vision, agentic]
+    signup: https://aistudio.google.com/apikey
+    limits:
+      rpm: 10
+      tpm: 250000
+      rpd: 250
+      confidence: vendor-docs
+      source: ai.google.dev/gemini-api/docs/rate-limits
+      note: gemini-2.5-flash class free tier; varies by model
+    models:
+      - gemini-2.5-flash
+      - gemini-2.5-flash-lite
+    notes: >
+      Gemini serves an OpenAI-compatible branch under /v1beta/openai.
+      Free tier is per-project; 429 responses include retry guidance.
+
+  openrouter:
+    label: OpenRouter (free models)
+    base_url: https://openrouter.ai/api/v1
+    provider: openai
+    capabilities: [fast, agentic]
+    signup: https://openrouter.ai/keys
+    limits:
+      rpm: 20
+      rpd: 50
+      confidence: vendor-docs
+      source: openrouter.ai/docs/api-reference/limits
+      note: >
+        :free-suffixed models; 50 requests/day without credits, 1000/day
+        once >=10 credits purchased. Daily cap resets at midnight UTC.
+    models:
+      - deepseek/deepseek-chat-v3.1:free
+      - meta-llama/llama-3.3-70b-instruct:free
+      - qwen/qwen3-coder:free
+    notes: >
+      Aggregator: one key, many free models. Prefer :free ids explicitly;
+      non-free ids bill the key.
+
+  sambanova:
+    label: SambaNova Cloud
+    base_url: https://api.sambanova.ai/v1
+    provider: openai
+    capabilities: [fast]
+    signup: https://cloud.sambanova.ai/apis
+    limits:
+      rpm: 10
+      rpd: 100
+      confidence: vendor-docs
+      source: docs.sambanova.ai
+      note: free tier caps vary by model; verify current values
+    models:
+      - Meta-Llama-3.3-70B-Instruct
+      - Meta-Llama-3.1-8B-Instruct
+    notes: >
+      Fast full-stack inference. Free tier is the most restrictive of the
+      seven — treat as overflow capacity, not a workhorse.
+
+  nous_portal:
+    label: Nous Research Portal (Hermes home backend)
+    base_url: https://inference-api.nousresearch.com/v1
+    provider: openai
+    capabilities: [agentic]
+    signup: https://nousresearch.com
+    limits:
+      confidence: unverified
+      source: dossier audit 2026-09-22 — endpoint/limits to verify with
+        provider docs before production reliance
+    models:
+      - Hermes-4-405B
+      - Hermes-4-70B
+    notes: >
+      The agent's home backend; the audit found a documented free tier.
+      Endpoint URL and quotas marked unverified: confirm before pooling
+      production keys. Counts toward the seven free tiers as the
+      Hermes-native lane.

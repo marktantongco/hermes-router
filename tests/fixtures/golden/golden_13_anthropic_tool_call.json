@@ -1,0 +1,70 @@
+{
+  "name": "golden_13_anthropic_tool_call",
+  "description": "/use:anthropic — anthropic tool_use block becomes OpenAI tool_calls",
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "Authorization": "Bearer golden-test-key-0001"
+    },
+    "body": {
+      "model": "auto",
+      "messages": [
+        {
+          "role": "user",
+          "content": "/use:anthropic What is the weather in Paris?"
+        }
+      ],
+      "stream": false
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "id": "msg_stub_tool",
+      "object": "chat.completion",
+      "created": 1727000000,
+      "model": "stub-anthropic",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Checking the weather.",
+            "tool_calls": [
+              {
+                "id": "toolu_stub_01",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": "{\"city\": \"Paris\"}"
+                }
+              }
+            ]
+          },
+          "finish_reason": "tool_calls"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 12,
+        "completion_tokens": 9,
+        "total_tokens": 21
+      },
+      "hermes_router": {
+        "provider": "anthropic"
+      }
+    }
+  },
+  "trace_events": [
+    {
+      "event": "route",
+      "tier": "anthropic",
+      "model": "stub-anthropic",
+      "upstream_status": 200,
+      "stream": false,
+      "provider": "anthropic"
+    }
+  ],
+  "volatile": false,
+  "notes": "stub returns tool_use for 'weather' prompts"
+}

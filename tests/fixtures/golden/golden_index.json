@@ -1,6 +1,6 @@
 {
-  "captured": "2026-10-11T02:55:56Z",
-  "upstream_commit": "694f82d9b9b4f2e472978fef576b7ab04b95be8b",
+  "captured": "2026-10-11T02:56:28Z",
+  "upstream_commit": "b1a64c6bf1de12a26583136cc1d36bad9b255847",
   "router_config": {
     "server": {
       "host": "127.0.0.1",
@@ -29,6 +29,55 @@
       "escalation_keywords": [],
       "de_escalation_keywords": []
     },
+    "key_pools": {
+      "rotate_pool": {
+        "default_cooldown_seconds": 1,
+        "max_cooldown_seconds": 5,
+        "keys": [
+          {
+            "ref": "GOLDEN_POOL_KEY_A",
+            "label": "key-a",
+            "capabilities": [
+              "fast"
+            ]
+          },
+          {
+            "ref": "GOLDEN_POOL_KEY_B",
+            "label": "key-b",
+            "capabilities": [
+              "fast",
+              "deep"
+            ]
+          }
+        ]
+      },
+      "exhaust_pool": {
+        "default_cooldown_seconds": 1,
+        "keys": [
+          {
+            "ref": "GOLDEN_POOL_KEY_C",
+            "label": "key-c"
+          },
+          {
+            "ref": "GOLDEN_POOL_KEY_D",
+            "label": "key-d"
+          }
+        ]
+      },
+      "stream_pool": {
+        "default_cooldown_seconds": 1,
+        "keys": [
+          {
+            "ref": "GOLDEN_POOL_KEY_E",
+            "label": "key-e"
+          },
+          {
+            "ref": "GOLDEN_POOL_KEY_F",
+            "label": "key-f"
+          }
+        ]
+      }
+    },
     "categories": {
       "simple": {
         "label": "Simple & Fast",
@@ -46,13 +95,54 @@
         "base_url": "http://127.0.0.1:9901/v1",
         "api_key_env": "",
         "timeout_seconds": 20
+      },
+      "anthropic": {
+        "label": "Anthropic protocol tier",
+        "provider": "anthropic",
+        "model": "stub-anthropic",
+        "base_url": "http://127.0.0.1:9901",
+        "api_key_env": "",
+        "timeout_seconds": 20,
+        "fallback_model": "stub-fallback",
+        "fallback_base_url": "http://127.0.0.1:9901/v1",
+        "fallback_provider": "openai",
+        "fallback_key_env": ""
+      },
+      "pooled": {
+        "label": "Pooled rotation tier",
+        "model": "stub-simple",
+        "base_url": "http://127.0.0.1:9901/v1",
+        "key_pool": "rotate_pool",
+        "require_capabilities": [
+          "fast"
+        ],
+        "timeout_seconds": 20
+      },
+      "pooled_exhaust": {
+        "label": "Pooled exhaustion tier",
+        "model": "stub-simple",
+        "base_url": "http://127.0.0.1:9901/v1",
+        "key_pool": "exhaust_pool",
+        "timeout_seconds": 20,
+        "fallback_model": "stub-fallback",
+        "fallback_base_url": "http://127.0.0.1:9901/v1",
+        "fallback_key_env": ""
+      },
+      "pooled_stream": {
+        "label": "Pooled streaming tier",
+        "model": "stub-simple",
+        "base_url": "http://127.0.0.1:9901/v1",
+        "key_pool": "stream_pool",
+        "timeout_seconds": 20
       }
     }
   },
   "notes": [
-    "Captured from UNMODIFIED upstream server.py against a deterministic stub",
+    "Captured from the staged server against a deterministic dual-protocol stub",
     "All tier selections use /use: overrides (classifier tiers bypassed)",
     "Volatile fields normalized; see 'volatile' flag per fixture",
+    "Stage 2: trace route events carry provider; scenarios 10-14 exercise adapters",
+    "Stage 3: scenarios 15-17 exercise key-pool rotation/exhaustion/streaming; route events carry key_id, key_rotation events carry from_key_id",
     "Re-capture at every stage boundary; diff = behavior regression signal"
   ],
   "fixtures": [
@@ -66,6 +156,15 @@
     "golden_07_multimodal",
     "golden_08_unauthorized_no_token",
     "golden_09_unauthorized_wrong_token",
+    "golden_10_anthropic_nonstream",
+    "golden_11_anthropic_stream",
+    "golden_12_anthropic_cascade",
+    "golden_13_anthropic_tool_call",
+    "golden_14_admin_providers",
+    "golden_15_pool_rotation",
+    "golden_16_pool_exhausted",
+    "golden_17_pool_stream_rotation",
+    "golden_92_admin_pools",
     "golden_90_health",
     "golden_91_metrics"
   ]

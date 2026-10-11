@@ -53,7 +53,8 @@
       "tier": "complex",
       "model": "stub-complex",
       "upstream_status": 200,
-      "stream": false
+      "stream": false,
+      "provider": "openai"
     }
   ],
   "volatile": false,

@@ -53,14 +53,16 @@
       "upstream_status": 500,
       "stream": false,
       "fallback_level": 1,
-      "fallback_model": "stub-fallback"
+      "fallback_model": "stub-fallback",
+      "provider": "openai"
     },
     {
       "event": "route",
       "tier": "simple",
       "model": "stub-fallback",
       "upstream_status": 200,
-      "stream": false
+      "stream": false,
+      "provider": "openai"
     }
   ],
   "volatile": false,

@@ -21,3 +21,4 @@ Thumbs.db
 
 # JSONL trace logs (contain user message previews)
 traces/
+*.egg-info/

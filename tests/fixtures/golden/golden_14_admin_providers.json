@@ -1,0 +1,76 @@
+{
+  "name": "golden_14_admin_providers",
+  "description": "GET /admin/providers — registry metadata, aliases, per-category resolution",
+  "request": {
+    "method": "GET",
+    "path": "/admin/providers",
+    "headers": {
+      "Authorization": "Bearer [set]"
+    },
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "registry": {
+        "openai": {
+          "protocol": "openai-chat-completions",
+          "streaming": true,
+          "tools": true,
+          "auth": "bearer",
+          "description": "Any /v1/chat/completions upstream (OpenAI, Ollama, LM Studio, vLLM, llama.cpp, aggregators).",
+          "aliases": [
+            "openai_compat",
+            "openai-compatible",
+            "ollama",
+            "lmstudio",
+            "vllm",
+            "llamacpp"
+          ]
+        },
+        "anthropic": {
+          "protocol": "anthropic-messages",
+          "streaming": true,
+          "tools": true,
+          "auth": "x-api-key",
+          "description": "Anthropic Messages API with native-schema translation and SSE synthesis.",
+          "aliases": []
+        }
+      },
+      "aliases": {
+        "openai_compat": "openai",
+        "openai-compatible": "openai",
+        "ollama": "openai",
+        "lmstudio": "openai",
+        "vllm": "openai",
+        "llamacpp": "openai"
+      },
+      "categories": {
+        "simple": {
+          "provider": "openai",
+          "fallback_provider": "openai"
+        },
+        "complex": {
+          "provider": "openai"
+        },
+        "anthropic": {
+          "provider": "anthropic",
+          "fallback_provider": "openai"
+        },
+        "pooled": {
+          "provider": "openai"
+        },
+        "pooled_exhaust": {
+          "provider": "openai",
+          "fallback_provider": "openai"
+        },
+        "pooled_stream": {
+          "provider": "openai"
+        }
+      }
+    }
+  },
+  "trace_events": [],
+  "volatile": false,
+  "notes": "Registry content is static; category resolution follows the fixture config"
+}

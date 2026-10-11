@@ -55,6 +55,69 @@ classifier:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Key pools (Stage 3) — 429-aware rotation over your own free-tier keys
+# ═══════════════════════════════════════════════════════════════════════════
+# A pool rotates several of YOUR OWN API keys for one endpoint. On HTTP 429
+# the used key cools down for the duration taken from the provider's own
+# retry headers (Retry-After seconds / HTTP-date, x-ratelimit-reset
+# duration tokens), then a policy default bounded by max_cooldown_seconds.
+# HTTP 401/403 quarantines the key until you fix the credential and reload
+# (or POST /admin/pools/<name>/unlock). Round-robin over available keys;
+# capability tags let categories filter (require_capabilities).
+#
+# References follow the Stage 1 rules: plain env names or ks:<alias>
+# keystore aliases (fail-closed). Secrets are never exposed via admin or
+# metrics surfaces. key ids ("<pool>/<label>") seed the Stage 4 ledger.
+#
+# key_pools:
+#   free_tier:
+#     strategy: round_robin            # only strategy in v1
+#     default_cooldown_seconds: 60     # when no usable header is present
+#     max_cooldown_seconds: 3600       # hard clamp on header-derived values
+#     disable_on_auth_failure: true    # 401/403 -> quarantine (false: cooldown)
+#     auth_failure_cooldown_seconds: 900
+#     keys:
+#       - ref: GROQ_KEY_1              # env name or ks:<alias>
+#         label: groq-1
+#         capabilities: [fast]
+#       - ref: ks:groq2
+#         label: groq-2
+#         capabilities: [fast, vision]
+#
+# Category usage (mutually exclusive with api_key_env / alternate_key_env):
+#
+#   categories:
+#     chat:
+#       model: llama-3.3-70b-versatile
+#       base_url: https://api.groq.com/openai/v1
+#       key_pool: free_tier
+#       require_capabilities: [fast]   # optional filter
+#       fallback_key_pool: other_pool  # fallbacks may pool independently
+#
+# Inspect live state: GET /admin/pools (auth required).
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Free-tier catalog (Stage 3) — optional, off by default
+# ═══════════════════════════════════════════════════════════════════════════
+# A data snapshot of the seven audited free tiers (Groq, Cerebras, Mistral,
+# Google Gemini, OpenRouter, SambaNova, Nous portal) with base URLs,
+# capability tags and documented limits. Categories can inherit provider
+# facts via `catalog_ref: <name>`; explicit fields always win. The refresh
+# job re-validates and atomically swaps the document; failures keep the
+# last-good copy live and are counted in /metrics.
+#
+# catalog:
+#   path: ""                    # default: bundled catalog/free_tiers.yaml
+#   url: ""                     # optional remote snapshot (needs allow_remote)
+#   allow_remote: false         # SECURITY: opt-in for remote pulls, no redirects
+#   refresh_minutes: 0          # >0 schedules the background refresh job
+#
+# Inspect: GET /admin/catalog · force refresh: POST /admin/catalog/refresh
+# (both auth required).
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Task Categories — define as many as you need
 # ═══════════════════════════════════════════════════════════════════════════
 categories:

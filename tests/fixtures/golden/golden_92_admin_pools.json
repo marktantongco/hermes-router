@@ -1,0 +1,115 @@
+{
+  "name": "golden_92_admin_pools",
+  "description": "GET /admin/pools — per-key counters after scenarios 15-17 (cooldowns excluded)",
+  "request": {
+    "method": "GET",
+    "path": "/admin/pools",
+    "headers": {
+      "Authorization": "Bearer [set]"
+    },
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "pools": [
+        {
+          "name": "rotate_pool",
+          "strategy": "round_robin",
+          "size": 2,
+          "keys": [
+            {
+              "key_id": "rotate_pool/key-a",
+              "label": "key-a",
+              "capabilities": [
+                "fast"
+              ],
+              "total_acquired": 1,
+              "total_429": 1,
+              "total_success": 0,
+              "total_auth_failures": 0,
+              "disabled": false,
+              "consecutive_429": 1
+            },
+            {
+              "key_id": "rotate_pool/key-b",
+              "label": "key-b",
+              "capabilities": [
+                "deep",
+                "fast"
+              ],
+              "total_acquired": 1,
+              "total_429": 0,
+              "total_success": 1,
+              "total_auth_failures": 0,
+              "disabled": false,
+              "consecutive_429": 0
+            }
+          ]
+        },
+        {
+          "name": "exhaust_pool",
+          "strategy": "round_robin",
+          "size": 2,
+          "keys": [
+            {
+              "key_id": "exhaust_pool/key-c",
+              "label": "key-c",
+              "capabilities": [],
+              "total_acquired": 1,
+              "total_429": 1,
+              "total_success": 0,
+              "total_auth_failures": 0,
+              "disabled": false,
+              "consecutive_429": 1
+            },
+            {
+              "key_id": "exhaust_pool/key-d",
+              "label": "key-d",
+              "capabilities": [],
+              "total_acquired": 1,
+              "total_429": 1,
+              "total_success": 0,
+              "total_auth_failures": 0,
+              "disabled": false,
+              "consecutive_429": 1
+            }
+          ]
+        },
+        {
+          "name": "stream_pool",
+          "strategy": "round_robin",
+          "size": 2,
+          "keys": [
+            {
+              "key_id": "stream_pool/key-e",
+              "label": "key-e",
+              "capabilities": [],
+              "total_acquired": 1,
+              "total_429": 1,
+              "total_success": 0,
+              "total_auth_failures": 0,
+              "disabled": false,
+              "consecutive_429": 1
+            },
+            {
+              "key_id": "stream_pool/key-f",
+              "label": "key-f",
+              "capabilities": [],
+              "total_acquired": 1,
+              "total_429": 0,
+              "total_success": 1,
+              "total_auth_failures": 0,
+              "disabled": false,
+              "consecutive_429": 0
+            }
+          ]
+        }
+      ],
+      "count": 3
+    }
+  },
+  "trace_events": [],
+  "volatile": true,
+  "notes": "Counters are cumulative and deterministic for this scenario order; cooldown/availability fields are volatile and omitted"
+}

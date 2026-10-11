@@ -1,0 +1,62 @@
+{
+  "name": "golden_17_pool_stream_rotation",
+  "description": "streaming through a pool: 429 on first key, SSE passthrough via second",
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "Authorization": "Bearer golden-test-key-0001"
+    },
+    "body": {
+      "model": "auto",
+      "messages": [
+        {
+          "role": "user",
+          "content": "/use:pooled_stream pooled stream please"
+        }
+      ],
+      "stream": true
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": [
+      "data: {\"id\":\"chatcmpl-stub-golden\",\"object\":\"chat.completion.chunk\",\"created\":1727000000,\"model\":\"stub-simple\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}",
+      "data: {\"id\":\"chatcmpl-stub-golden\",\"object\":\"chat.completion.chunk\",\"created\":1727000000,\"model\":\"stub-simple\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\" from\"},\"finish_reason\":null}]}",
+      "data: {\"id\":\"chatcmpl-stub-golden\",\"object\":\"chat.completion.chunk\",\"created\":1727000000,\"model\":\"stub-simple\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\" the stub.\",\"final\":true},\"finish_reason\":null}]}",
+      "data: [DONE]"
+    ]
+  },
+  "trace_events": [
+    {
+      "event": "circuit",
+      "old_state": "closed",
+      "new_state": "open",
+      "base_url": "<stub>"
+    },
+    {
+      "event": "key_rotation",
+      "tier": "pooled_stream",
+      "reason": "pool_429_cooldown_stream",
+      "from_key_id": "stream_pool/key-e",
+      "base_url": "<stub>"
+    },
+    {
+      "event": "circuit",
+      "old_state": "open",
+      "new_state": "closed",
+      "base_url": "<stub>"
+    },
+    {
+      "event": "route",
+      "tier": "pooled_stream",
+      "model": "stub-simple",
+      "upstream_status": 200,
+      "stream": true,
+      "provider": "openai",
+      "key_id": "stream_pool/key-f"
+    }
+  ],
+  "volatile": false,
+  "notes": "pool_429_cooldown_stream rotation then normal SSE synthesis"
+}

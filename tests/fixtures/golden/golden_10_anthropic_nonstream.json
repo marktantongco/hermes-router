@@ -1,0 +1,60 @@
+{
+  "name": "golden_10_anthropic_nonstream",
+  "description": "/use:anthropic — Anthropic Messages upstream translated to OpenAI shape",
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "Authorization": "Bearer golden-test-key-0001"
+    },
+    "body": {
+      "model": "auto",
+      "messages": [
+        {
+          "role": "user",
+          "content": "/use:anthropic What is the capital of France?"
+        }
+      ],
+      "stream": false
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "id": "msg_stub_anthropic",
+      "object": "chat.completion",
+      "created": 1727000000,
+      "model": "stub-anthropic",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Stub response for golden fixture."
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 7,
+        "completion_tokens": 6,
+        "total_tokens": 13
+      },
+      "hermes_router": {
+        "provider": "anthropic"
+      }
+    }
+  },
+  "trace_events": [
+    {
+      "event": "route",
+      "tier": "anthropic",
+      "model": "stub-anthropic",
+      "upstream_status": 200,
+      "stream": false,
+      "provider": "anthropic"
+    }
+  ],
+  "volatile": false,
+  "notes": "hermes_router.provider annotation marks the non-default provider"
+}

@@ -138,8 +138,14 @@ def trace_route(
     fallback_model: str | None = None,
     stream: bool = False,
     provider: str | None = None,
+    key_id: str | None = None,
 ) -> None:
-    """Emit a route/forward trace event."""
+    """Emit a route/forward trace event.
+
+    ``key_id`` (Stage 3): stable pooled-key identifier
+    ("<pool>/<label>") when a key pool served the request — the Stage 4
+    ledger's per-key attribution seed. Omitted for single-key routes.
+    """
     fields: dict[str, Any] = {
         "session_key": session_key,
         "tier": tier,
@@ -149,6 +155,8 @@ def trace_route(
     }
     if provider is not None:
         fields["provider"] = provider
+    if key_id is not None:
+        fields["key_id"] = key_id
     if latency_ms is not None:
         fields["latency_ms"] = round(latency_ms, 1)
     if fallback_level is not None:
@@ -179,14 +187,20 @@ def trace_key_rotation(
     base_url: str,
     tier: str,
     reason: str,
+    from_key_id: str | None = None,
 ) -> None:
-    """Emit a key rotation trace event."""
-    trace_event(
-        "key_rotation",
-        base_url=base_url,
-        tier=tier,
-        reason=reason,
-    )
+    """Emit a key rotation trace event.
+
+    ``from_key_id`` (Stage 3): the pooled key that triggered the rotation.
+    """
+    fields: dict[str, Any] = {
+        "base_url": base_url,
+        "tier": tier,
+        "reason": reason,
+    }
+    if from_key_id is not None:
+        fields["from_key_id"] = from_key_id
+    trace_event("key_rotation", **fields)
 
 
 def trace_stream_error(

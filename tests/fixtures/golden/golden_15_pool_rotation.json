@@ -1,0 +1,65 @@
+{
+  "name": "golden_15_pool_rotation",
+  "description": "pool rotates to the next key on 429; served by the healthy key",
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "Authorization": "Bearer golden-test-key-0001"
+    },
+    "body": {
+      "model": "auto",
+      "messages": [
+        {
+          "role": "user",
+          "content": "/use:pooled pooled rotation please"
+        }
+      ],
+      "stream": false
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "id": "chatcmpl-stub-golden",
+      "object": "chat.completion",
+      "created": 1727000000,
+      "model": "stub-simple",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Stub response for golden fixture."
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 5,
+        "completion_tokens": 6,
+        "total_tokens": 11
+      }
+    }
+  },
+  "trace_events": [
+    {
+      "event": "key_rotation",
+      "tier": "pooled",
+      "reason": "pool_429_cooldown",
+      "from_key_id": "rotate_pool/key-a",
+      "base_url": "<stub>"
+    },
+    {
+      "event": "route",
+      "tier": "pooled",
+      "model": "stub-simple",
+      "upstream_status": 200,
+      "stream": false,
+      "provider": "openai",
+      "key_id": "rotate_pool/key-b"
+    }
+  ],
+  "volatile": false,
+  "notes": "key_rotation event carries from_key_id; route event carries serving key_id"
+}

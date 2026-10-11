@@ -1,0 +1,45 @@
+{
+  "name": "golden_11_anthropic_stream",
+  "description": "/use:anthropic streaming — Anthropic events synthesized as OpenAI chunks",
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "Authorization": "Bearer golden-test-key-0001"
+    },
+    "body": {
+      "model": "auto",
+      "messages": [
+        {
+          "role": "user",
+          "content": "/use:anthropic Tell me a short story"
+        }
+      ],
+      "stream": true
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": [
+      "data: {\"id\":\"msg_stub_anthropic\",\"object\":\"chat.completion.chunk\",\"created\":1727000000,\"model\":\"stub-anthropic\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}",
+      "data: {\"id\":\"msg_stub_anthropic\",\"object\":\"chat.completion.chunk\",\"created\":1727000000,\"model\":\"stub-anthropic\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Stub\"},\"finish_reason\":null}]}",
+      "data: {\"id\":\"msg_stub_anthropic\",\"object\":\"chat.completion.chunk\",\"created\":1727000000,\"model\":\"stub-anthropic\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" response\"},\"finish_reason\":null}]}",
+      "data: {\"id\":\"msg_stub_anthropic\",\"object\":\"chat.completion.chunk\",\"created\":1727000000,\"model\":\"stub-anthropic\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" for golden fixture.\"},\"finish_reason\":null}]}",
+      "data: {\"id\":\"msg_stub_anthropic\",\"object\":\"chat.completion.chunk\",\"created\":1727000000,\"model\":\"stub-anthropic\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}",
+      "data: {\"id\":\"msg_stub_anthropic\",\"object\":\"chat.completion.chunk\",\"created\":1727000000,\"model\":\"stub-anthropic\",\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":6,\"total_tokens\":13}}",
+      "data: [DONE]"
+    ]
+  },
+  "trace_events": [
+    {
+      "event": "route",
+      "tier": "anthropic",
+      "model": "stub-anthropic",
+      "upstream_status": 200,
+      "stream": true,
+      "provider": "anthropic"
+    }
+  ],
+  "volatile": false,
+  "notes": "role chunk, text deltas, finish chunk, usage chunk, [DONE]"
+}
