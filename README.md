@@ -192,6 +192,30 @@ models:
     # ... same structure as simple
 ```
 
+### Provider Adapters (Stage 2)
+
+Every category (and each fallback) dispatches through a **provider adapter** selected by `provider:`. The external surface stays OpenAI-compatible; translation lives upstream-side.
+
+| Provider | Protocol | Use for |
+|----------|----------|---------|
+| `openai` (default) | `/v1/chat/completions` | OpenAI, Ollama, LM Studio, vLLM, llama.cpp, aggregators (aliases: `ollama`, `lmstudio`, `vllm`, `llamacpp`, `openai_compat`) |
+| `anthropic` | `/v1/messages` | Anthropic Messages API — full request/response translation, SSE synthesis to OpenAI chunks, tool-call round trips |
+
+```yaml
+categories:
+  agent:
+    provider: anthropic            # adapter selection (fail-closed: unknown names refuse to start)
+    model: claude-sonnet-4-5
+    base_url: https://api.anthropic.com   # host root — adapter appends /v1/messages
+    api_key_env: ANTHROPIC_API_KEY
+    max_tokens_default: 8192       # Anthropic requires max_tokens; used when client omits it
+    fallback_model: deepseek-v4-pro
+    fallback_base_url: https://ollama.com/v1
+    fallback_provider: openai      # fallbacks may cross protocols; unset inherits primary
+```
+
+Introspect the live registry and per-category resolution at `GET /admin/providers` (auth required). Trace `route` events carry `provider` attribution; non-default providers annotate success responses with `hermes_router.provider`. Adapter limitations (documented in `providers.py`): unsupported OpenAI fields (`n`, `logprobs`, `response_format`, ...) are dropped with a debug log; `tool_choice: "none"` drops tools entirely; images accept data URIs and http(s) URLs.
+
 ### Circuit Breaker
 
 ```yaml

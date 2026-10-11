@@ -14,6 +14,12 @@ Determinism strategy:
   - scenario texts avoid every escalation/de-escalation keyword
   - volatile trace fields (ts, latency, session hashes) are normalized
 
+Stage 2: the stub speaks BOTH protocols — OpenAI /v1/chat/completions and
+Anthropic /v1/messages — and scenarios 10-14 exercise the anthropic adapter
+text / streaming / cross-protocol fallback / tool-call paths plus the
+/admin/providers registry snapshot. HERMES_ROUTER_FIXED_EPOCH pins the
+timestamps the adapter synthesizes.
+
 Usage:  python3 tools/capture_golden.py
 """
 from __future__ import annotations
@@ -52,6 +58,7 @@ FIXED_BODY = "Stub response for golden fixture."
 
 RUNTIME_FILES = [
     "server.py",
+    "providers.py",
     "trace.py",
     "keystore.py",
     "surrogate_models.py",
@@ -75,6 +82,24 @@ def _sse_chunk(idx: int, model: str) -> str:
         "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
     }
     return f"data: {json.dumps(payload, separators=(',', ':'))}"
+
+
+def _anth_event(name: str, data: dict) -> str:
+    """One deterministic Anthropic SSE frame (event + data + blank line)."""
+    return (f"event: {name}\n"
+            f"data: {json.dumps(data, separators=(',', ':'))}\n\n")
+
+
+def _last_user_text_anthropic(messages: list) -> str:
+    for m in reversed(messages or []):
+        if m.get("role") == "user":
+            content = m.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") == "text")
+            return str(content)
+    return ""
 
 
 def build_stub_app() -> FastAPI:
@@ -120,6 +145,70 @@ def build_stub_app() -> FastAPI:
             "usage": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11},
         })
 
+    @app.post("/v1/messages")
+    async def anthropic_messages(request: Request):
+        """Anthropic-protocol stub (Stage 2) — deterministic, no auth."""
+        payload = await request.json()
+        model = payload.get("model", "stub-anthropic-unknown")
+        text = _last_user_text_anthropic(payload.get("messages", []))
+
+        # Deterministic primary failure for the cross-protocol cascade
+        if "trigger-fallback" in text:
+            return JSONResponse(
+                {"type": "error",
+                 "error": {"type": "api_error", "message": "stub anthropic failure"}},
+                status_code=500,
+            )
+
+        # Tool-use round trip: anthropic tool_use block -> OpenAI tool_calls
+        if "weather" in text:
+            return JSONResponse({
+                "id": "msg_stub_tool", "type": "message", "role": "assistant",
+                "model": model,
+                "content": [
+                    {"type": "text", "text": "Checking the weather."},
+                    {"type": "tool_use", "id": "toolu_stub_01",
+                     "name": "get_weather", "input": {"city": "Paris"}},
+                ],
+                "stop_reason": "tool_use", "stop_sequence": None,
+                "usage": {"input_tokens": 12, "output_tokens": 9},
+            })
+
+        if payload.get("stream"):
+            def gen_anth():
+                yield _anth_event("message_start", {
+                    "type": "message_start",
+                    "message": {"id": "msg_stub_anthropic", "type": "message",
+                                "role": "assistant", "model": model, "content": [],
+                                "usage": {"input_tokens": 7}},
+                })
+                yield _anth_event("content_block_start", {
+                    "type": "content_block_start", "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                })
+                for part in ("Stub", " response", " for golden fixture."):
+                    yield _anth_event("content_block_delta", {
+                        "type": "content_block_delta", "index": 0,
+                        "delta": {"type": "text_delta", "text": part},
+                    })
+                yield _anth_event("content_block_stop", {
+                    "type": "content_block_stop", "index": 0})
+                yield _anth_event("message_delta", {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": 6},
+                })
+                yield _anth_event("message_stop", {"type": "message_stop"})
+            return StreamingResponse(gen_anth(), media_type="text/event-stream")
+
+        return JSONResponse({
+            "id": "msg_stub_anthropic", "type": "message", "role": "assistant",
+            "model": model,
+            "content": [{"type": "text", "text": FIXED_BODY}],
+            "stop_reason": "end_turn", "stop_sequence": None,
+            "usage": {"input_tokens": 7, "output_tokens": 6},
+        })
+
     @app.get("/health")
     async def health():
         return {"ok": True}
@@ -150,6 +239,7 @@ def normalize_trace(records: list[dict]) -> list[dict]:
         "event", "tier", "model", "upstream_status", "stream",
         "fallback_level", "fallback_model", "direction", "reason",
         "old_state", "new_state", "failure_count", "max_failures",
+        "provider",
     ]
     out = []
     for r in records:
@@ -286,6 +376,38 @@ def run_scenarios(client: httpx.Client, trace_path: Path) -> list[dict]:
            request_headers={"Authorization": "Bearer [REDACTED-WRONG]"},
            notes="Wrong token; constant-time comparison rejects; never reaches upstream")
 
+    # 10 — Stage 2: anthropic adapter, non-streaming translation
+    post_chat("golden_10_anthropic_nonstream",
+              "/use:anthropic — Anthropic Messages upstream translated to OpenAI shape",
+              [user_msg("/use:anthropic What is the capital of France?")],
+              notes="hermes_router.provider annotation marks the non-default provider")
+
+    # 11 — Stage 2: anthropic adapter, SSE synthesis to OpenAI chunks
+    post_chat("golden_11_anthropic_stream",
+              "/use:anthropic streaming — Anthropic events synthesized as OpenAI chunks",
+              [user_msg("/use:anthropic Tell me a short story")], stream=True,
+              notes="role chunk, text deltas, finish chunk, usage chunk, [DONE]")
+
+    # 12 — Stage 2: cross-protocol fallback cascade (anthropic -> openai)
+    post_chat("golden_12_anthropic_cascade",
+              "anthropic primary 500 -> openai fallback 200; translated + annotated",
+              [user_msg("/use:anthropic trigger-fallback please")],
+              notes="stub fails stub-anthropic on 'trigger-fallback'; openai stub-fallback 200")
+
+    # 13 — Stage 2: anthropic tool_use -> OpenAI tool_calls synthesis
+    post_chat("golden_13_anthropic_tool_call",
+              "/use:anthropic — anthropic tool_use block becomes OpenAI tool_calls",
+              [user_msg("/use:anthropic What is the weather in Paris?")],
+              notes="stub returns tool_use for 'weather' prompts")
+
+    # 14 — Stage 2: provider registry snapshot (deterministic)
+    r = client.get(f"{ROUTER_URL}/admin/providers", headers={"Authorization": AUTH_HEADER})
+    record("golden_14_admin_providers",
+           "GET /admin/providers — registry metadata, aliases, per-category resolution",
+           None, "/admin/providers", "GET", r.status_code, r.json(), None,
+           notes="Registry content is static; category resolution follows the fixture config",
+           request_headers={"Authorization": "Bearer [set]"})
+
     return fixtures
 
 
@@ -348,6 +470,7 @@ def main() -> None:
     env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp),
            "TRACE_LOG_DIR": str(trace_dir), "TRACE_LOG_ENABLED": "true",
            "PYTHONUNBUFFERED": "1",
+           "HERMES_ROUTER_FIXED_EPOCH": str(FIXED_CREATED),
            "GOLDEN_ROUTER_KEY": GOLDEN_ROUTER_KEY}
     env.update({k: v for k, v in __import__("os").environ.items()
                 if k.startswith(("LC_", "LANG_"))})
@@ -371,9 +494,10 @@ def main() -> None:
                 text=True).stdout.strip(),
             "router_config": yaml.safe_load(CONFIG_SRC.read_text()),
             "notes": [
-                "Captured from UNMODIFIED upstream server.py against a deterministic stub",
+                "Captured from the staged server against a deterministic dual-protocol stub",
                 "All tier selections use /use: overrides (classifier tiers bypassed)",
                 "Volatile fields normalized; see 'volatile' flag per fixture",
+                "Stage 2: trace route events carry provider; scenarios 10-14 exercise adapters",
                 "Re-capture at every stage boundary; diff = behavior regression signal",
             ],
             "fixtures": [f["name"] for f in fixtures],

@@ -49,3 +49,14 @@ categories:
     base_url: http://127.0.0.1:9901/v1
     api_key_env: ''
     timeout_seconds: 20
+  anthropic:
+    label: Anthropic protocol tier
+    provider: anthropic
+    model: stub-anthropic
+    base_url: http://127.0.0.1:9901
+    api_key_env: ''
+    timeout_seconds: 20
+    fallback_model: stub-fallback
+    fallback_base_url: http://127.0.0.1:9901/v1
+    fallback_provider: openai
+    fallback_key_env: ''

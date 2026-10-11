@@ -73,8 +73,8 @@ def test_01_simple_nonstream_contract():
     assert body["id"] == "chatcmpl-stub-golden"  # stub id passes through untouched
     assert d["trace_events"] == [{
         "event": "route", "tier": "simple", "model": "stub-simple",
-        "upstream_status": 200, "stream": False,
-    }]
+        "upstream_status": 200, "stream": False, "provider": "openai",
+    }]  # Stage 2: route events carry provider attribution
 
 
 def test_02_complex_nonstream_contract():
@@ -162,6 +162,87 @@ def test_09_unauthorized_wrong_token_contract():
     d = _load("golden_09_unauthorized_wrong_token")
     assert d["response"]["status"] == 401
     assert d["response"]["body"]["detail"]["error"]["type"] == "auth_error"
+
+
+# ── Stage 2 provider contracts ───────────────────────────────────────────
+
+def test_10_anthropic_nonstream_contract():
+    d = _load("golden_10_anthropic_nonstream")
+    body = d["response"]["body"]
+    assert d["response"]["status"] == 200
+    assert body["object"] == "chat.completion"
+    assert body["id"] == "msg_stub_anthropic"
+    assert body["created"] == 1727000000
+    assert body["choices"][0]["message"]["content"] == "Stub response for golden fixture."
+    assert body["choices"][0]["finish_reason"] == "stop"
+    assert body["usage"] == {"prompt_tokens": 7, "completion_tokens": 6,
+                             "total_tokens": 13}
+    assert body["hermes_router"]["provider"] == "anthropic"
+    assert d["trace_events"][0]["provider"] == "anthropic"
+
+
+def test_11_anthropic_stream_contract():
+    d = _load("golden_11_anthropic_stream")
+    sse = d["response"]["body"]
+    assert d["response"]["status"] == 200
+    chunks = [json.loads(c.removeprefix("data: ")) for c in sse if c != "data: [DONE]"]
+    assert chunks[0]["choices"][0]["delta"] == {"role": "assistant", "content": ""}
+    assert chunks[0]["id"] == "msg_stub_anthropic"
+    content = "".join(ch["choices"][0]["delta"].get("content", "")
+                      for ch in chunks[1:4] if ch.get("choices"))
+    assert content == "Stub response for golden fixture."
+    finishes = [ch["choices"][0]["finish_reason"] for ch in chunks
+                if ch.get("choices") and ch["choices"][0]["finish_reason"]]
+    assert finishes == ["stop"]
+    usage_chunks = [ch for ch in chunks if ch.get("choices") == [] and "usage" in ch]
+    assert usage_chunks[0]["usage"] == {"prompt_tokens": 7,
+                                        "completion_tokens": 6, "total_tokens": 13}
+    assert sse[-1] == "data: [DONE]"
+    assert d["trace_events"][0]["provider"] == "anthropic"
+
+
+def test_12_anthropic_cross_protocol_cascade_contract():
+    d = _load("golden_12_anthropic_cascade")
+    body = d["response"]["body"]
+    assert d["response"]["status"] == 200
+    assert body["model"] == "stub-fallback"
+    assert body["object"] == "chat.completion"
+    assert body["hermes_router"]["fallback_used"] is True
+    assert "provider" not in body["hermes_router"]  # openai producer stays unannotated
+    events = d["trace_events"]
+    assert events[0]["provider"] == "anthropic"      # failed anthropic primary
+    assert events[0]["upstream_status"] == 500
+    assert events[1]["provider"] == "openai"         # openai fallback served it
+    assert events[1]["upstream_status"] == 200
+
+
+def test_13_anthropic_tool_call_contract():
+    d = _load("golden_13_anthropic_tool_call")
+    body = d["response"]["body"]
+    assert d["response"]["status"] == 200
+    assert body["choices"][0]["finish_reason"] == "tool_calls"
+    msg = body["choices"][0]["message"]
+    assert msg["content"] == "Checking the weather."
+    assert msg["tool_calls"] == [{
+        "id": "toolu_stub_01", "type": "function",
+        "function": {"name": "get_weather",
+                     "arguments": '{"city": "Paris"}'}}]
+    assert body["usage"] == {"prompt_tokens": 12, "completion_tokens": 9,
+                             "total_tokens": 21}
+    assert body["hermes_router"]["provider"] == "anthropic"
+    assert d["trace_events"][0]["provider"] == "anthropic"
+
+
+def test_14_admin_providers_contract():
+    d = _load("golden_14_admin_providers")
+    body = d["response"]["body"]
+    assert d["response"]["status"] == 200
+    assert set(body["registry"]) == {"openai", "anthropic"}
+    assert body["registry"]["anthropic"]["protocol"] == "anthropic-messages"
+    assert body["registry"]["openai"]["protocol"] == "openai-chat-completions"
+    assert body["categories"]["anthropic"]["provider"] == "anthropic"
+    assert body["categories"]["anthropic"]["fallback_provider"] == "openai"
+    assert body["categories"]["simple"]["provider"] == "openai"
 
 
 def test_90_health_open_and_91_metrics_protected():

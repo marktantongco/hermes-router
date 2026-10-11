@@ -137,6 +137,7 @@ def trace_route(
     fallback_level: int | None = None,
     fallback_model: str | None = None,
     stream: bool = False,
+    provider: str | None = None,
 ) -> None:
     """Emit a route/forward trace event."""
     fields: dict[str, Any] = {
@@ -146,6 +147,8 @@ def trace_route(
         "upstream_status": upstream_status,
         "stream": stream,
     }
+    if provider is not None:
+        fields["provider"] = provider
     if latency_ms is not None:
         fields["latency_ms"] = round(latency_ms, 1)
     if fallback_level is not None:

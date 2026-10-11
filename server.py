@@ -86,6 +86,16 @@ except ImportError:  # keystore unavailable -> env-only resolution
             raise KeystoreError("keystore module unavailable - cannot resolve ks: reference")
         return os.environ.get(ref or "", "").strip()
 
+# ── Provider abstraction (Stage 2) — adapters behind one internal interface ─
+from providers import (
+    PROVIDER_ALIASES,
+    PROVIDER_REGISTRY,
+    AdapterError,
+    get_provider,
+    provider_name,
+    validate_provider_config,
+)
+
 # ── Zero-shot embedding classifier (optional, no LLM needed) ──────────────
 try:
     from zero_shot_classifier import get_zero_shot
@@ -1109,9 +1119,20 @@ async def call_model(
     (2s, 4s, 8s) so transient overloads are resolved before escalation.
     Uses _post_with_retry for transient transport error resilience.
     """
-    base_url = model_cfg["base_url"].rstrip("/")
-    url = f"{base_url}/chat/completions"
     model_name = model_cfg["model"]
+
+    # Stage 2: resolve the provider adapter (fail-closed — an unknown
+    # provider yields a synthetic 502 so the fallback cascade advances).
+    try:
+        provider = get_provider(model_cfg)
+    except AdapterError as exc:
+        log.error("Provider resolution failed for %s: %s", model_name, exc)
+        r = httpx.Response(502, text=str(exc))
+        r._request = httpx.Request("POST", "gateway://providers")
+        return r
+
+    base_url = model_cfg["base_url"].rstrip("/")
+    url = provider.build_url(model_cfg)
 
     # Circuit breaker check (keyed per base_url+model so one 503 model doesn't block others on same host)
     if _circuit_is_open(cfg, base_url, model_name):
@@ -1126,10 +1147,10 @@ async def call_model(
     timeout = model_cfg.get("timeout_seconds", 120)
     alt_key = env_key(model_cfg.get("alternate_key_env", ""))
 
-    payload = {**request_payload, "model": model_cfg["model"]}
-    headers: dict[str, str] = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    # Stage 2: provider-native request assembly (translation + auth headers)
+    built = provider.build_request(model_cfg, request_payload, api_key)
+    payload = built.json
+    headers = built.headers
 
     async with httpx.AsyncClient() as client:
         # ── 503 retry: exponential backoff (2s, 4s, 8s) ──────────────────────────
@@ -1175,7 +1196,7 @@ async def call_model(
             _circuit_record_failure(cfg, base_url, model_name)
             _inc_metric_tier(model_cfg.get("tier", "unknown"), "429")
             _inc_metric("429_total")
-        elif resp.status_code in (502, 503, 504):
+        elif resp.status_code in (502, 503, 504, 529):  # 529 = Anthropic overloaded
             _circuit_record_failure(cfg, base_url, model_name)
         elif resp.status_code == 200:
             _circuit_record_success(cfg, base_url, model_name)
@@ -1193,7 +1214,7 @@ async def call_model(
                 resp = await client.post(
                     url,
                     json=payload,
-                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {alt_key}"},
+                    headers=provider.build_headers(alt_key),
                     timeout=httpx.Timeout(timeout),
                 )
             except Exception as exc:
@@ -1207,6 +1228,20 @@ async def call_model(
                 log.info("Alternate key succeeded")
                 _circuit_record_success(cfg, base_url, model_name)
                 _clear_retry(session_key(request_payload.get("messages", [])) or "")
+
+    # Stage 2: translate provider-native success bodies to the OpenAI shape.
+    # Untranslatable bodies become 502 so the fallback cascade can engage
+    # (previously a malformed 200 raised a raw 500 with no fallback path).
+    if resp.status_code == 200:
+        try:
+            translated = provider.translate_response(
+                resp.json(), request_payload, model_cfg)
+        except Exception as exc:
+            log.error("Response translation failed for %s: %s", model_name, exc)
+            r = httpx.Response(502, text=f"response translation failed: {exc}")
+            r._request = resp.request
+            return r
+        return httpx.Response(200, json=translated, request=resp.request)
 
     return resp
 
@@ -1370,6 +1405,12 @@ async def route_request_stream(cfg: dict, payload: dict):
             model_name = attempt_cfg["model"]
             log.info("Streaming attempt %s: %s → %s", attempt_label, key, model_name)
 
+            try:
+                provider = get_provider(attempt_cfg)
+            except AdapterError as exc:
+                log.error("Provider resolution failed for %s: %s", model_name, exc)
+                continue  # try next tier
+
             # Circuit breaker check (per model so one 503 model doesn't block siblings on same host)
             base_url = attempt_cfg["base_url"].rstrip("/")
             if _circuit_is_open(cfg, base_url, model_name):
@@ -1378,18 +1419,19 @@ async def route_request_stream(cfg: dict, payload: dict):
                     session_key=key, tier=category, model=model_name,
                     upstream_status=429, stream=True,
                     fallback_level=attempt_idx + 1,
+                    provider=provider.name,
                 )
                 _inc_metric_tier(category, "429")
                 continue  # try next tier
 
-            stream_url = f"{base_url}/chat/completions"
             api_key = env_key(attempt_cfg["api_key_env"])
             alt_key = env_key(attempt_cfg.get("alternate_key_env", ""))
             timeout = attempt_cfg.get("timeout_seconds", 120)
-            stream_payload = {**payload, "model": model_name}
-            headers: dict[str, str] = {"Content-Type": "application/json"}
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
+            # Stage 2: provider-native request assembly
+            stream_built = provider.build_request(attempt_cfg, payload, api_key)
+            stream_url = stream_built.url
+            stream_payload = stream_built.json
+            headers = stream_built.headers
 
             # ── Key rotation: if primary key gets 429, try alternate ────
             key_attempts: list[tuple[str | None, str]] = (
@@ -1400,7 +1442,7 @@ async def route_request_stream(cfg: dict, payload: dict):
 
             for key_val, key_label in key_attempts:
                 if key_val:
-                    headers["Authorization"] = f"Bearer {key_val}"
+                    headers = provider.build_headers(key_val)
 
                 try:
                     async with client.stream(
@@ -1428,6 +1470,7 @@ async def route_request_stream(cfg: dict, payload: dict):
                                 session_key=key, tier=category, model=model_name,
                                 upstream_status=429, stream=True,
                                 fallback_level=attempt_idx + 1,
+                                provider=provider.name,
                             )
                             break  # both keys 429'd, try next tier
 
@@ -1444,9 +1487,7 @@ async def route_request_stream(cfg: dict, payload: dict):
                                     )
                                     await asyncio.sleep(backoff)
                                     # Retry the stream request
-                                    retry_headers = dict(headers)
-                                    if key_val:
-                                        retry_headers["Authorization"] = f"Bearer {key_val}"
+                                    retry_headers = provider.build_headers(key_val)
                                     try:
                                         async with client.stream(
                                             "POST", stream_url, json=stream_payload, headers=retry_headers,
@@ -1458,15 +1499,15 @@ async def route_request_stream(cfg: dict, payload: dict):
                                                 trace_route(
                                                     session_key=key, tier=category, model=model_name,
                                                     upstream_status=200, stream=True,
+                                                    provider=provider.name,
                                                 )
                                                 if attempt_label != "primary":
                                                     _inc_metric("fallback_used_total" if attempt_label == "fallback1" else "fallback2_used_total")
                                                 try:
+                                                    retry_translator = provider.open_stream_translator(payload, attempt_cfg)
                                                     async for line in retry_resp.aiter_lines():
-                                                        if line:
-                                                            yield f"{line}\n".encode()
-                                                        else:
-                                                            yield b"\n"
+                                                        for chunk in retry_translator.feed(line):
+                                                            yield chunk
                                                     _clear_retry(key)
                                                     return  # clean completion
                                                 except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as stream_exc:
@@ -1495,6 +1536,7 @@ async def route_request_stream(cfg: dict, payload: dict):
                             trace_route(
                                 session_key=key, tier=category, model=model_name,
                                 upstream_status=resp.status_code, stream=True,
+                                provider=provider.name,
                             )
                             break  # non-429 error on this tier, try next
 
@@ -1505,16 +1547,16 @@ async def route_request_stream(cfg: dict, payload: dict):
                         trace_route(
                             session_key=key, tier=category, model=model_name,
                             upstream_status=200, stream=True,
+                            provider=provider.name,
                         )
                         if attempt_label != "primary":
                             _inc_metric("fallback_used_total" if attempt_label == "fallback1" else "fallback2_used_total")
 
                         try:
+                            translator = provider.open_stream_translator(payload, attempt_cfg)
                             async for line in resp.aiter_lines():
-                                if line:
-                                    yield f"{line}\n".encode()
-                                else:
-                                    yield b"\n"
+                                for chunk in translator.feed(line):
+                                    yield chunk
                             _clear_retry(key)
                             return  # clean completion
 
@@ -1661,9 +1703,12 @@ async def route_request(cfg: dict, payload: dict) -> JSONResponse:
             trace_route(
                 session_key=key, tier=category, model=cat_cfg["model"],
                 upstream_status=200, stream=False,
+                provider=provider_name(cat_cfg),
             )
             _clear_retry(key)
-            return JSONResponse(content=resp.json())
+            data = resp.json()
+            _annotate_provider(data, cat_cfg)
+            return JSONResponse(content=data)
     else:
         resp = httpx.Response(503, text="Skipped primary due to consecutive failures")
         resp._request = httpx.Request("POST", f"{cat_cfg['base_url'].rstrip('/')}/chat/completions")
@@ -1685,6 +1730,7 @@ async def route_request(cfg: dict, payload: dict) -> JSONResponse:
         session_key=key, tier=category, model=cat_cfg["model"],
         upstream_status=resp.status_code, stream=False,
         fallback_level=1, fallback_model=fallback_model,
+        provider=provider_name(cat_cfg),
     )
     fb_cfg = {
         "model": fallback_model,
@@ -1693,15 +1739,19 @@ async def route_request(cfg: dict, payload: dict) -> JSONResponse:
         "alternate_key_env": cat_cfg.get("fallback_alternate_key_env", ""),
         "timeout_seconds": cat_cfg.get("timeout_seconds", 120),
         "tier": category,
+        # Stage 2: fallbacks may cross protocols; default inherits primary
+        "provider": cat_cfg.get("fallback_provider") or cat_cfg.get("provider") or "openai",
     }
     fb_resp = await call_model(cfg, fb_cfg, payload)
 
     if fb_resp.status_code == 200:
         data = fb_resp.json()
         data.setdefault("hermes_router", {})["fallback_used"] = True
+        _annotate_provider(data, fb_cfg)
         trace_route(
             session_key=key, tier=category, model=fallback_model,
             upstream_status=200, stream=False,
+            provider=provider_name(fb_cfg),
         )
         return JSONResponse(content=data)
 
@@ -1717,6 +1767,7 @@ async def route_request(cfg: dict, payload: dict) -> JSONResponse:
             session_key=key, tier=category, model=fallback_model,
             upstream_status=fb_resp.status_code, stream=False,
             fallback_level=2, fallback_model=fb2_model,
+            provider=provider_name(fb_cfg),
         )
         fb2_cfg = {
             "model": fb2_model,
@@ -1725,14 +1776,18 @@ async def route_request(cfg: dict, payload: dict) -> JSONResponse:
             "alternate_key_env": cat_cfg.get("fallback2_alternate_key_env", ""),
             "timeout_seconds": cat_cfg.get("timeout_seconds", 120),
             "tier": category,
+            # Stage 2: fallbacks may cross protocols; default inherits primary
+            "provider": cat_cfg.get("fallback2_provider") or cat_cfg.get("provider") or "openai",
         }
         fb2_resp = await call_model(cfg, fb2_cfg, payload)
         if fb2_resp.status_code == 200:
             data = fb2_resp.json()
             data.setdefault("hermes_router", {})["fallback_used"] = True
+            _annotate_provider(data, fb2_cfg)
             trace_route(
                 session_key=key, tier=category, model=fb2_model,
                 upstream_status=200, stream=False,
+                provider=provider_name(fb2_cfg),
             )
             return JSONResponse(content=data)
         return _proxy_error(fb2_resp)
@@ -1741,6 +1796,18 @@ async def route_request(cfg: dict, payload: dict) -> JSONResponse:
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
+
+def _annotate_provider(data: dict, model_cfg: dict) -> None:
+    """Stage 2: surface the producing provider on non-default routes.
+
+    openai (the default) responses stay untouched — existing consumers and
+    the golden contract see no change. Non-openai providers gain
+    ``hermes_router.provider`` for operator and ledger visibility.
+    """
+    pname = provider_name(model_cfg)
+    if pname != "openai":
+        data.setdefault("hermes_router", {})["provider"] = pname
+
 
 def _last_user_text(messages: list[dict]) -> str:
     """Extract the text content of the most recent user message."""
@@ -1844,13 +1911,20 @@ def _startup() -> None:
     # Note: deprecated in FastAPI 0.93+ but functional.
     cfg = load_config()
     validate_security_posture(cfg)
+    provider_errors = validate_provider_config(cfg)
+    if provider_errors:
+        for p_err in provider_errors:
+            log.fatal("Refusing to start: %s", p_err)
+        sys.exit(1)
     log.info("Router starting on %s:%s", cfg["server"]["host"], cfg["server"]["port"])
     log.info("  Classifier: %s (%s)", cfg["classifier"]["model"], cfg["classifier"]["base_url"])
     cats = cfg.get("categories", {})
     log.info("  Categories (%d):", len(cats))
     for name, c in cats.items():
         label = c.get("label", name)
-        log.info("    %s (%s): %s (%s)", name, label, c.get("model", "?"), c.get("base_url", "?"))
+        log.info("    %s (%s): %s (%s) [provider: %s]",
+                 name, label, c.get("model", "?"), c.get("base_url", "?"),
+                 c.get("provider", "openai"))
         if c.get("fallback_model"):
             log.info("      fallback: %s (%s)", c.get("fallback_model", "?"), c.get("fallback_base_url", "?"))
     if not cats:
@@ -1925,6 +1999,14 @@ async def reload_config(request: Request):
         raise HTTPException(
             status_code=400,
             detail={"error": {"message": "Missing or empty 'categories' section in config", "type": "reload_error"}},
+        )
+
+    # Stage 2: provider names must resolve before the swap is accepted
+    provider_errors = validate_provider_config(new_cfg)
+    if provider_errors:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"message": "; ".join(provider_errors), "type": "reload_error"}},
         )
 
     # Clear profile_hint so extraction runs with fresh config
@@ -2320,6 +2402,28 @@ async def get_config(request: Request):
     return cfg_copy
 
 
+@app.get("/admin/providers")
+async def list_providers(request: Request):
+    """Stage 2: provider registry — capability metadata + per-category resolution."""
+    verify_auth(request)
+    cfg = request.app.state.config
+    categories: dict[str, Any] = {}
+    for name, cat in (cfg.get("categories") or {}).items():
+        entry: dict[str, Any] = {"provider": provider_name(cat)}
+        if cat.get("fallback_model"):
+            entry["fallback_provider"] = provider_name({
+                "provider": cat.get("fallback_provider") or cat.get("provider") or "openai"})
+        if cat.get("fallback2_model"):
+            entry["fallback2_provider"] = provider_name({
+                "provider": cat.get("fallback2_provider") or cat.get("provider") or "openai"})
+        categories[name] = entry
+    return {
+        "registry": {n: a.metadata() for n, a in PROVIDER_REGISTRY.items()},
+        "aliases": PROVIDER_ALIASES,
+        "categories": categories,
+    }
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """OpenAI-compatible chat completions — routed automatically."""
@@ -2415,6 +2519,13 @@ if __name__ == "__main__":
     # Stage 1: security posture pre-flight — refuse authless starts (fails
     # closed before uvicorn even binds a socket).
     validate_security_posture(cfg)
+
+    # Stage 2: provider config must resolve before the socket binds.
+    provider_errors = validate_provider_config(cfg)
+    if provider_errors:
+        for p_err in provider_errors:
+            log.fatal("Refusing to start: %s", p_err)
+        sys.exit(1)
 
     # Stage 1: localhost is the default bind. Environment overrides exist for
     # containers (Dockerfile sets ROUTER_HOST=0.0.0.0 intentionally; exposure

@@ -32,6 +32,28 @@ classifier:
 
   session_timeout_minutes: 5
 
+# ═══════════════════════════════════════════════════════════════════
+# Provider adapters (Stage 2)
+# ═══════════════════════════════════════════════════════════════════
+# Each category (and each fallback) dispatches through a provider adapter
+# selected by name. Unknown names refuse to start (fail-closed).
+#
+#   provider: openai      (default) any /v1/chat/completions upstream —
+#                         OpenAI, Ollama, LM Studio, vLLM, llama.cpp.
+#                         Aliases: ollama, lmstudio, vllm, llamacpp,
+#                         openai_compat, openai-compatible.
+#   provider: anthropic   Anthropic Messages API — full OpenAI <-> Anthropic
+#                         translation incl. streaming SSE synthesis and tool
+#                         calls. base_url is the HOST ROOT (the adapter
+#                         appends /v1/messages), e.g. https://api.anthropic.com
+#
+# Fallbacks may cross protocols: set fallback_provider (and
+# fallback2_provider) explicitly; unset inherits the primary's provider.
+# `max_tokens_default` sets the mandatory Anthropic max_tokens when the
+# client request does not carry max_tokens (default 4096).
+# Introspect live resolution at GET /admin/providers (auth required).
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Task Categories — define as many as you need
 # ═══════════════════════════════════════════════════════════════════════════
@@ -59,6 +81,20 @@ categories:
     fallback_base_url: ""
     fallback_key_env: ""
     fallback_alternate_key_env: ""
+
+  # Example: Anthropic-protocol tier with a cross-protocol OpenAI fallback.
+  # agent:
+  #   label: "Agentic & Tools"
+  #   provider: anthropic
+  #   model: claude-sonnet-4-5
+  #   base_url: https://api.anthropic.com
+  #   api_key_env: ANTHROPIC_API_KEY
+  #   max_tokens_default: 8192
+  #   timeout_seconds: 300
+  #   fallback_model: deepseek-v4-pro
+  #   fallback_base_url: https://ollama.com/v1
+  #   fallback_provider: openai
+  #   fallback_key_env: OLLAMA_API_KEY
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Keyword Deviation
