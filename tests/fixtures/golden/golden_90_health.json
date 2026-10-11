@@ -1,0 +1,22 @@
+{
+  "name": "golden_90_health",
+  "description": "GET /health — structure snapshot (session count volatile)",
+  "request": {
+    "method": "GET",
+    "path": "/health",
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "sessions_keys": [
+        "sessions",
+        "status"
+      ]
+    }
+  },
+  "trace_events": [],
+  "volatile": true,
+  "notes": "Body structure only; values vary per capture"
+}

@@ -1,0 +1,49 @@
+# Golden-fixture router config (Stage 0).
+# Used by tools/capture_golden.py to drive the UNMODIFIED upstream server
+# against a deterministic stub upstream. Captures current behavior as the
+# baseline contract for Stage 2+ contract tests.
+#
+# Posture notes (intentional, matches shipped defaults):
+#   - auth disabled (api_key_env empty)  -> Stage 1 changes this; re-capture
+#   - classifier tier disabled via /use: overrides in every scenario
+#     (classifier endpoint points at the stub but is never called)
+
+server:
+  host: 127.0.0.1
+  port: 9902
+
+auth:
+  api_key_env: ''
+
+classifier:
+  model: stub-classifier
+  base_url: http://127.0.0.1:9901/v1
+  session_timeout_minutes: 5
+  zero_shot:
+    enabled: false
+  fasttext:
+    enabled: false
+  setfit:
+    enabled: false
+
+routing:
+  override_prefix: '/use:'
+  escalation_keywords: []
+  de_escalation_keywords: []
+
+categories:
+  simple:
+    label: Simple & Fast
+    model: stub-simple
+    base_url: http://127.0.0.1:9901/v1
+    api_key_env: ''
+    fallback_model: stub-fallback
+    fallback_base_url: http://127.0.0.1:9901/v1
+    fallback_key_env: ''
+    timeout_seconds: 20
+  complex:
+    label: Complex & Smart
+    model: stub-complex
+    base_url: http://127.0.0.1:9901/v1
+    api_key_env: ''
+    timeout_seconds: 20

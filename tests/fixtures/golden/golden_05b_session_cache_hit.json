@@ -1,0 +1,66 @@
+{
+  "name": "golden_05b_session_cache_hit",
+  "description": "follow-up reuses cached tier (cache_hit trace event, no reclassify)",
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "body": {
+      "model": "auto",
+      "messages": [
+        {
+          "role": "user",
+          "content": "/use:simple Remember this anchor"
+        },
+        {
+          "role": "assistant",
+          "content": "Understood."
+        },
+        {
+          "role": "user",
+          "content": "what is 2+2"
+        }
+      ],
+      "stream": false
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "id": "chatcmpl-stub-golden",
+      "object": "chat.completion",
+      "created": 1727000000,
+      "model": "stub-simple",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Stub response for golden fixture."
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 5,
+        "completion_tokens": 6,
+        "total_tokens": 11
+      }
+    }
+  },
+  "trace_events": [
+    {
+      "event": "cache_hit",
+      "tier": "simple",
+      "model": "stub-simple"
+    },
+    {
+      "event": "route",
+      "tier": "simple",
+      "model": "stub-simple",
+      "upstream_status": 200,
+      "stream": false
+    }
+  ],
+  "volatile": false,
+  "notes": "Same first user message -> same session key; neutral follow-up text"
+}

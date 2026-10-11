@@ -1,0 +1,69 @@
+{
+  "captured": "2026-10-11T02:55:41Z",
+  "upstream_commit": "0a9560e23d42d0faf6f89afd0fa947ad5b3aad88",
+  "router_config": {
+    "server": {
+      "host": "127.0.0.1",
+      "port": 9902
+    },
+    "auth": {
+      "api_key_env": ""
+    },
+    "classifier": {
+      "model": "stub-classifier",
+      "base_url": "http://127.0.0.1:9901/v1",
+      "session_timeout_minutes": 5,
+      "zero_shot": {
+        "enabled": false
+      },
+      "fasttext": {
+        "enabled": false
+      },
+      "setfit": {
+        "enabled": false
+      }
+    },
+    "routing": {
+      "override_prefix": "/use:",
+      "escalation_keywords": [],
+      "de_escalation_keywords": []
+    },
+    "categories": {
+      "simple": {
+        "label": "Simple & Fast",
+        "model": "stub-simple",
+        "base_url": "http://127.0.0.1:9901/v1",
+        "api_key_env": "",
+        "fallback_model": "stub-fallback",
+        "fallback_base_url": "http://127.0.0.1:9901/v1",
+        "fallback_key_env": "",
+        "timeout_seconds": 20
+      },
+      "complex": {
+        "label": "Complex & Smart",
+        "model": "stub-complex",
+        "base_url": "http://127.0.0.1:9901/v1",
+        "api_key_env": "",
+        "timeout_seconds": 20
+      }
+    }
+  },
+  "notes": [
+    "Captured from UNMODIFIED upstream server.py against a deterministic stub",
+    "All tier selections use /use: overrides (classifier tiers bypassed)",
+    "Volatile fields normalized; see 'volatile' flag per fixture",
+    "Re-capture at every stage boundary; diff = behavior regression signal"
+  ],
+  "fixtures": [
+    "golden_01_simple_nonstream",
+    "golden_02_complex_nonstream",
+    "golden_03_streaming",
+    "golden_04_fallback_cascade",
+    "golden_05a_session_first",
+    "golden_05b_session_cache_hit",
+    "golden_06_error_no_user",
+    "golden_07_multimodal",
+    "golden_90_health",
+    "golden_91_metrics"
+  ]
+}

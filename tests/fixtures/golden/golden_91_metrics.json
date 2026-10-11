@@ -1,0 +1,49 @@
+{
+  "name": "golden_91_metrics",
+  "description": "GET /metrics — metric key inventory (counters volatile)",
+  "request": {
+    "method": "GET",
+    "path": "/metrics",
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "metric_keys": [
+        "429_total",
+        "cache_hits_total",
+        "classifier_calls_total",
+        "classifier_latency_ms_avg",
+        "classifier_latency_ms_sum",
+        "errors_total",
+        "fallback2_used_total",
+        "fallback_used_total",
+        "requests_total",
+        "requests_total_complex",
+        "requests_total_simple",
+        "sessions_active",
+        "stream_requests_total"
+      ],
+      "prometheus_metric_names": [
+        "hermes_router_429_total",
+        "hermes_router_429_total{category=\"complex\"}",
+        "hermes_router_429_total{category=\"simple\"}",
+        "hermes_router_cache_hits_total",
+        "hermes_router_circuits_open",
+        "hermes_router_classifier_calls_total",
+        "hermes_router_classifier_latency_ms_avg",
+        "hermes_router_classifier_latency_ms_sum",
+        "hermes_router_errors_total",
+        "hermes_router_fallback_used_total{level=\"1\"}",
+        "hermes_router_fallback_used_total{level=\"2\"}",
+        "hermes_router_requests_total{category=\"complex\"}",
+        "hermes_router_requests_total{category=\"simple\"}",
+        "hermes_router_sessions_active",
+        "hermes_router_stream_requests_total"
+      ]
+    }
+  },
+  "trace_events": [],
+  "volatile": true,
+  "notes": "Names/keys only; values vary per capture"
+}

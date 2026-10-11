@@ -1,0 +1,65 @@
+{
+  "name": "golden_04_fallback_cascade",
+  "description": "primary 500 -> fallback model succeeds; hermes_router.fallback_used added",
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "body": {
+      "model": "auto",
+      "messages": [
+        {
+          "role": "user",
+          "content": "/use:simple trigger-fallback please"
+        }
+      ],
+      "stream": false
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "id": "chatcmpl-stub-golden",
+      "object": "chat.completion",
+      "created": 1727000000,
+      "model": "stub-fallback",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Stub response for golden fixture."
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 5,
+        "completion_tokens": 6,
+        "total_tokens": 11
+      },
+      "hermes_router": {
+        "fallback_used": true
+      }
+    }
+  },
+  "trace_events": [
+    {
+      "event": "route",
+      "tier": "simple",
+      "model": "stub-simple",
+      "upstream_status": 500,
+      "stream": false,
+      "fallback_level": 1,
+      "fallback_model": "stub-fallback"
+    },
+    {
+      "event": "route",
+      "tier": "simple",
+      "model": "stub-fallback",
+      "upstream_status": 200,
+      "stream": false
+    }
+  ],
+  "volatile": false,
+  "notes": "Stub fails stub-simple on 'trigger-fallback'; stub-fallback always 200"
+}

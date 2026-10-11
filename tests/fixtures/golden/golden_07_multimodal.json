@@ -1,0 +1,58 @@
+{
+  "name": "golden_07_multimodal",
+  "description": "content array (text part) routes via override; list content forwarded as-is",
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "body": {
+      "model": "auto",
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "/use:complex Describe this image"
+            }
+          ]
+        }
+      ],
+      "stream": false
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "id": "chatcmpl-stub-golden",
+      "object": "chat.completion",
+      "created": 1727000000,
+      "model": "stub-complex",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Stub response for golden fixture."
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 5,
+        "completion_tokens": 6,
+        "total_tokens": 11
+      }
+    }
+  },
+  "trace_events": [
+    {
+      "event": "route",
+      "tier": "complex",
+      "model": "stub-complex",
+      "upstream_status": 200,
+      "stream": false
+    }
+  ],
+  "volatile": false,
+  "notes": "Upstream replaces str content only; list content keeps override prefix"
+}

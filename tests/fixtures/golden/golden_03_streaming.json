@@ -1,0 +1,38 @@
+{
+  "name": "golden_03_streaming",
+  "description": "SSE passthrough of upstream chunks, terminated by [DONE]",
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "body": {
+      "model": "auto",
+      "messages": [
+        {
+          "role": "user",
+          "content": "/use:simple Tell me a short story"
+        }
+      ],
+      "stream": true
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": [
+      "data: {\"id\":\"chatcmpl-stub-golden\",\"object\":\"chat.completion.chunk\",\"created\":1727000000,\"model\":\"stub-simple\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}",
+      "data: {\"id\":\"chatcmpl-stub-golden\",\"object\":\"chat.completion.chunk\",\"created\":1727000000,\"model\":\"stub-simple\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\" from\"},\"finish_reason\":null}]}",
+      "data: {\"id\":\"chatcmpl-stub-golden\",\"object\":\"chat.completion.chunk\",\"created\":1727000000,\"model\":\"stub-simple\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\" the stub.\",\"final\":true},\"finish_reason\":null}]}",
+      "data: [DONE]"
+    ]
+  },
+  "trace_events": [
+    {
+      "event": "route",
+      "tier": "simple",
+      "model": "stub-simple",
+      "upstream_status": 200,
+      "stream": true
+    }
+  ],
+  "volatile": false,
+  "notes": "SSE transcript, in order"
+}
