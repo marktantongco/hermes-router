@@ -1,0 +1,31 @@
+{
+  "name": "golden_08_unauthorized_no_token",
+  "description": "401 when no Authorization header is presented (auth mandatory)",
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {},
+    "body": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "/use:simple hi"
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 401,
+    "body": {
+      "detail": {
+        "error": {
+          "message": "Invalid or missing API key",
+          "type": "auth_error"
+        }
+      }
+    }
+  },
+  "trace_events": [],
+  "volatile": false,
+  "notes": "No Authorization header; request never reaches the stub upstream"
+}

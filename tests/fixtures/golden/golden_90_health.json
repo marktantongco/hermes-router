@@ -1,9 +1,10 @@
 {
   "name": "golden_90_health",
-  "description": "GET /health — structure snapshot (session count volatile)",
+  "description": "GET /health — open liveness surface, no auth required",
   "request": {
     "method": "GET",
     "path": "/health",
+    "headers": {},
     "body": null
   },
   "response": {

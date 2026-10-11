@@ -1,9 +1,12 @@
 {
   "name": "golden_91_metrics",
-  "description": "GET /metrics — metric key inventory (counters volatile)",
+  "description": "GET /metrics — auth-protected metric key inventory (counters volatile)",
   "request": {
     "method": "GET",
     "path": "/metrics",
+    "headers": {
+      "Authorization": "Bearer [set]"
+    },
     "body": null
   },
   "response": {

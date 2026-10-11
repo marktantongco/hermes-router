@@ -85,12 +85,20 @@ routing:
   override_prefix: "/use:"
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Stage 1: auth is MANDATORY. The server refuses to start unless a key is
+# configured and resolvable. Opt out only for local development with
+#   auth: { mode: disabled, api_key_env: '' }
+# The key may be an environment-variable NAME or a keystore alias ('ks:<alias>'
+# resolved from the encrypted store managed by `python -m keystore`).
 auth:
+  mode: required
   api_key_env: ROUTER_PROXY_API_KEY
 
 server:
   port: 8766
-  host: 0.0.0.0
+  # Stage 1: localhost by default. Containers: set ROUTER_HOST=0.0.0.0
+  # (the Dockerfile does this) — exposure is controlled by the port mapping.
+  host: 127.0.0.1
 
 persona:
   user_path: /root/.hermes/memories/USER.md

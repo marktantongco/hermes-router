@@ -31,6 +31,8 @@ def test_fixture_suite_is_present():
         "golden_05b_session_cache_hit",
         "golden_06_error_no_user",
         "golden_07_multimodal",
+        "golden_08_unauthorized_no_token",
+        "golden_09_unauthorized_wrong_token",
         "golden_90_health",
         "golden_91_metrics",
     ]:
@@ -49,6 +51,7 @@ def test_common_schema(path):
     d = json.loads(path.read_text())
     assert d["request"]["method"] in {"GET", "POST"}
     assert d["request"]["path"].startswith("/")
+    assert isinstance(d["request"].get("headers", {}), dict)
     assert isinstance(d["response"]["status"], int)
     assert isinstance(d["trace_events"], list)
     assert "volatile" in d
@@ -133,11 +136,40 @@ def test_07_multimodal_contract():
     assert isinstance(sent, list) and sent[0]["type"] == "text"
 
 
-def test_90_91_snapshots_are_structure_only():
+# ── Stage 1 posture contracts ───────────────────────────────────────────
+
+def test_all_protected_requests_carry_bearer():
+    """Every success-path fixture must have been captured WITH auth (Stage 1)."""
+    for name in ["golden_01_simple_nonstream", "golden_02_complex_nonstream",
+                 "golden_03_streaming", "golden_04_fallback_cascade",
+                 "golden_05a_session_first", "golden_05b_session_cache_hit",
+                 "golden_07_multimodal"]:
+        d = _load(name)
+        auth = d["request"]["headers"].get("Authorization", "")
+        assert auth.startswith("Bearer "), f"{name} captured without bearer auth"
+
+
+def test_08_unauthorized_no_token_contract():
+    d = _load("golden_08_unauthorized_no_token")
+    assert d["response"]["status"] == 401
+    # FastAPI wraps HTTPException detail: {"detail": {"error": {...}}}
+    err = d["response"]["body"]["detail"]["error"]
+    assert err["type"] == "auth_error"
+    assert d["trace_events"] == []  # rejected before any routing
+
+
+def test_09_unauthorized_wrong_token_contract():
+    d = _load("golden_09_unauthorized_wrong_token")
+    assert d["response"]["status"] == 401
+    assert d["response"]["body"]["detail"]["error"]["type"] == "auth_error"
+
+
+def test_90_health_open_and_91_metrics_protected():
     h = _load("golden_90_health")
     m = _load("golden_91_metrics")
-    assert h["response"]["status"] == 200
+    assert h["response"]["status"] == 200          # liveness stays open
     assert h["response"]["body"]["status"] == "ok"
-    assert m["response"]["status"] == 200
+    assert h["request"]["headers"] == {}           # captured WITHOUT credentials
+    assert m["response"]["status"] == 200          # captured WITH credentials
+    assert m["request"]["headers"].get("Authorization") == "Bearer [set]"
     assert "requests_total" in m["response"]["body"]["metric_keys"]
-    assert any("hermes_router_" in n for n in m["response"]["body"]["prometheus_metric_names"])

@@ -1,10 +1,11 @@
-# Golden-fixture router config (Stage 0).
-# Used by tools/capture_golden.py to drive the UNMODIFIED upstream server
-# against a deterministic stub upstream. Captures current behavior as the
-# baseline contract for Stage 2+ contract tests.
+# Golden-fixture router config (Stage 1 posture).
+# Used by tools/capture_golden.py to drive the hardened server against a
+# deterministic stub upstream. Captures current behavior as the baseline
+# contract for Stage 2+ contract tests.
 #
-# Posture notes (intentional, matches shipped defaults):
-#   - auth disabled (api_key_env empty)  -> Stage 1 changes this; re-capture
+# Posture notes (Stage 1):
+#   - auth REQUIRED (bearer token via GOLDEN_ROUTER_KEY env) — negative-authz
+#     fixtures 08/09 record the 401 path
 #   - classifier tier disabled via /use: overrides in every scenario
 #     (classifier endpoint points at the stub but is never called)
 
@@ -13,7 +14,8 @@ server:
   port: 9902
 
 auth:
-  api_key_env: ''
+  mode: required
+  api_key_env: GOLDEN_ROUTER_KEY
 
 classifier:
   model: stub-classifier

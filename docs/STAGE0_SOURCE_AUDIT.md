@@ -70,3 +70,9 @@ Extended rule set debt (not yet enabled, 42 findings: BLE001×16, I001×7, EXE00
 - [x] No upstream file modified (additive-only diff)
 
 **Stage 0 verdict: PASS.** Next: Stage 1 — Security hardening (localhost default bind, mandatory bearer auth, encrypted key store, secrets redaction, CORS lockdown, pip-audit + bandit gates), after which the fixture suite is re-captured to diff the posture change.
+
+---
+
+## Erratum (2026-09-22, recorded during Stage 1)
+
+Section 3 stated the shipped `router_config.yaml` disables auth ("ships `api_key_env: ''`"). That is **incorrect**: line 4's empty value belongs to the `classifier` section; the `auth` section (line 350) correctly sets `api_key_env: ROUTER_PROXY_API_KEY`, and the example config does the same. The verified auth gaps that remain are: (a) auth is *optional by code* — a config omitting `auth.api_key_env` silently passes all requests (Stage 1 makes it fail-closed); (b) the shipped bind is `0.0.0.0`; (c) CORS defaults to `*` with credentials. The fixture note "matches shipped defaults (auth disabled)" described the fixture config's own choice, not the upstream default. Correction applies to both the download copy and this file.

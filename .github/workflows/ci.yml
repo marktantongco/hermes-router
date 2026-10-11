@@ -29,5 +29,11 @@ jobs:
       - name: Mypy (types)
         run: python -m mypy server.py trace.py
 
-      - name: Pytest (trace suite + golden fixture contracts)
+      - name: Bandit (security lint, runtime surface)
+        run: python -m bandit -r server.py keystore.py trace.py
+
+      - name: pip-audit (dependency vulnerabilities, project closure)
+        run: pip-audit -r requirements-audit.txt --no-deps --desc off
+
+      - name: Pytest (trace suite + golden fixture contracts + security suite)
         run: python -m pytest

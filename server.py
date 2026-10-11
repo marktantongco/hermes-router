@@ -49,14 +49,22 @@ try:
         _now_iso,
     )
 except ImportError:  # pragma: no cover
-    trace_classify = lambda *a, **kw: None
-    trace_cache_hit = lambda *a, **kw: None
-    trace_deviation = lambda *a, **kw: None
-    trace_route = lambda *a, **kw: None
-    trace_circuit = lambda *a, **kw: None
-    trace_key_rotation = lambda *a, **kw: None
-    trace_stream_error = lambda *a, **kw: None
-    _now_iso = lambda: __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    def trace_classify(*a, **kw):  # type: ignore[misc,no-redef]
+        return None
+    def trace_cache_hit(*a, **kw):  # type: ignore[misc,no-redef]
+        return None
+    def trace_deviation(*a, **kw):  # type: ignore[misc,no-redef]
+        return None
+    def trace_route(*a, **kw):  # type: ignore[misc,no-redef]
+        return None
+    def trace_circuit(*a, **kw):  # type: ignore[misc,no-redef]
+        return None
+    def trace_key_rotation(*a, **kw):  # type: ignore[misc,no-redef]
+        return None
+    def trace_stream_error(*a, **kw):  # type: ignore[misc,no-redef]
+        return None
+    def _now_iso():  # type: ignore[misc,no-redef]
+        return __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 import httpx
 import yaml
@@ -67,23 +75,37 @@ from fastapi.responses import JSONResponse, StreamingResponse
 # Shared model classes — needed so joblib can deserialize embedding-based pipelines
 from surrogate_models import SentenceTransformerVectorizer  # noqa: F401
 
+# ── Encrypted keystore (Stage 1) — 'ks:<alias>' key references ────────────
+try:
+    from keystore import KeystoreError, resolve_key
+except ImportError:  # keystore unavailable -> env-only resolution
+    class KeystoreError(RuntimeError):  # type: ignore[misc,no-redef]
+        pass
+    def resolve_key(ref):  # type: ignore[misc,no-redef]
+        if isinstance(ref, str) and ref.startswith("ks:"):
+            raise KeystoreError("keystore module unavailable - cannot resolve ks: reference")
+        return os.environ.get(ref or "", "").strip()
+
 # ── Zero-shot embedding classifier (optional, no LLM needed) ──────────────
 try:
     from zero_shot_classifier import get_zero_shot
 except ImportError:
-    get_zero_shot = lambda cfg: None  # noqa: E731
+    def get_zero_shot(cfg):  # type: ignore[misc,no-redef]
+        return None
 
 # ── fastText classifier (tier 0, ultra-fast, <0.01ms) ─────────────────────
 try:
     from fasttext_classifier import get_fasttext
 except ImportError:
-    get_fasttext = lambda cfg: None  # noqa: E731
+    def get_fasttext(cfg):  # type: ignore[misc,no-redef]
+        return None
 
 # ── SetFit classifier (tier 1, ~10ms, fine-tuned sentence transformer) ────
 try:
     from setfit_classifier import get_setfit
 except ImportError:
-    get_setfit = lambda cfg: None  # noqa: E731
+    def get_setfit(cfg):  # type: ignore[misc,no-redef]
+        return None
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 class JsonFormatter(logging.Formatter):
@@ -107,11 +129,33 @@ class JsonFormatter(logging.Formatter):
 
 _log_format = os.environ.get("LOG_FORMAT", "").strip().lower()
 if _log_format == "json":
-    _formatter = JsonFormatter()
+    _formatter: logging.Formatter = JsonFormatter()
 else:
     _formatter = logging.Formatter(
         "%(asctime)s [router] %(levelname)s %(message)s"
     )
+
+# ── Secrets redaction (Stage 1) ────────────────────────────────────────────
+_REDACT_RULES = [
+    (re.compile(r"(Bearer\s+)[^\s\",;]+"), r"\1[REDACTED]"),
+    (re.compile(r"\b(?:sk|rk|fk)-[A-Za-z0-9_\-]{8,}"), "[REDACTED-KEY]"),
+]
+
+class RedactFilter(logging.Filter):
+    """Scrub bearer tokens and API-key-shaped strings from every log record."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        cleaned = msg
+        for pattern, repl in _REDACT_RULES:
+            cleaned = pattern.sub(repl, cleaned)
+        if cleaned != msg:
+            record.msg = cleaned
+            record.args = None
+        return True
 
 logging.basicConfig(
     level=logging.INFO,
@@ -119,6 +163,7 @@ logging.basicConfig(
 )
 _log_handler = logging.getLogger().handlers[0]
 _log_handler.setFormatter(_formatter)
+_log_handler.addFilter(RedactFilter())
 
 log = logging.getLogger("hermes-router")
 
@@ -163,8 +208,44 @@ def load_config() -> dict[str, Any]:
 
 
 def env_key(name: str) -> str:
-    """Read an API key from the environment.  Returns empty string on miss."""
-    return os.environ.get(name, "").strip()
+    """Resolve a key reference.
+
+    Plain names resolve from the process environment exactly as before
+    (backward compatible). ``ks:<alias>`` references resolve from the
+    encrypted keystore (keystore.py) and fail closed on any keystore
+    problem (missing master key, missing alias, corrupt store).
+    """
+    return resolve_key(name)
+
+
+def _auth_mode(cfg: dict) -> str:
+    auth = cfg.get("auth", {}) or {}
+    return str(auth.get("mode", "required")).strip().lower()
+
+
+def validate_security_posture(cfg: dict) -> None:
+    """Stage 1: fail closed at startup when auth is required but unresolvable.
+
+    Auth is mandatory by default. Opting out requires an explicit
+    ``auth.mode: disabled`` in the config, which is logged loudly.
+    """
+    if _auth_mode(cfg) == "disabled":
+        log.warning("AUTH DISABLED by config (auth.mode=disabled) — "
+                    "bind to localhost only and never expose this port")
+        return
+    ref = (cfg.get("auth", {}) or {}).get("api_key_env", "")
+    if not ref:
+        log.fatal("Refusing to start: auth.mode='required' but auth.api_key_env is not configured")
+        sys.exit(1)
+    try:
+        expected = env_key(ref)
+    except KeystoreError as exc:
+        log.fatal("Refusing to start: auth key reference %r unresolved: %s", ref, exc)
+        sys.exit(1)
+    if not expected:
+        log.fatal("Refusing to start: auth key %r resolves to an empty value", ref)
+        sys.exit(1)
+    log.info("Auth: required (key source: %s)", "keystore" if ref.startswith("ks:") else "env")
 
 
 # ── Profile Hint (lazy extraction) ──────────────────────────────────────────
@@ -708,7 +789,7 @@ def _levenshtein(s1: str, s2: str) -> int:
         return _levenshtein(s2, s1)
     if len(s2) == 0:
         return len(s1)
-    prev = range(len(s2) + 1)
+    prev: list[int] = list(range(len(s2) + 1))
     for i, c1 in enumerate(s1):
         curr = [i + 1]
         for j, c2 in enumerate(s2):
@@ -1311,7 +1392,9 @@ async def route_request_stream(cfg: dict, payload: dict):
                 headers["Authorization"] = f"Bearer {api_key}"
 
             # ── Key rotation: if primary key gets 429, try alternate ────
-            key_attempts = [(api_key, "primary_key")] if api_key else [(None, "no_key")]
+            key_attempts: list[tuple[str | None, str]] = (
+                [(api_key, "primary_key")] if api_key else [(None, "no_key")]
+            )
             if alt_key:
                 key_attempts.append((alt_key, "alternate_key"))
 
@@ -1697,18 +1780,25 @@ def _proxy_error(resp: httpx.Response) -> JSONResponse:
 # ── FastAPI Application ─────────────────────────────────────────────────────
 
 def verify_auth(request: Request):
-    """Check Bearer token against configured API key."""
+    """Check Bearer token against the configured auth key (Stage 1: mandatory).
+
+    Resolution order for the expected key: ``auth.api_key_env`` may name an
+    environment variable or a keystore alias (``ks:<alias>``). Auth can only
+    be turned off with an explicit ``auth.mode: disabled`` (see
+    validate_security_posture, which also refuses to start when a required
+    key is missing or empty).
+    """
     cfg = request.app.state.config
-    key_env = cfg.get("auth", {}).get("api_key_env", "")
-    if not key_env:
-        return  # No auth configured — allow all
-    expected = os.environ.get(key_env, "").strip()
+    if _auth_mode(cfg) == "disabled":
+        return  # explicit opt-out only
+    auth = cfg.get("auth", {}) or {}
+    ref = auth.get("api_key_env", "")
+    expected = env_key(ref) if ref else ""
     if not expected:
-        # Bug #22 fix: If auth is explicitly configured but the env var is
-        # empty, reject all requests rather than silently allowing them.
+        # Fail closed: required auth with no resolvable key rejects everything.
         raise HTTPException(
             status_code=401,
-            detail={"error": {"message": "API key env var is empty — auth required", "type": "auth_error"}},
+            detail={"error": {"message": "Auth required but no key configured", "type": "auth_error"}},
         )
     auth_header = request.headers.get("Authorization", "")
     token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
@@ -1726,22 +1816,34 @@ app = FastAPI(
     redoc_url=None,
 )
 
-# ── CORS ──────────────────────────────────────────────────────────────────
-origins_raw = os.environ.get("CORS_ORIGINS", "*").strip()
-allowed_origins = [o.strip() for o in origins_raw.split(",") if o.strip()]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ── CORS (Stage 1: locked down) ───────────────────────────────────────────
+# Default: NO CORS middleware (same-origin only). Cross-origin access requires
+# an explicit CORS_ORIGINS allow-list. The wildcard is honored only with
+# credentials disabled — browsers would reject the combination anyway, and a
+# credentialed wildcard is never a legitimate posture for a billing-adjacent
+# proxy holding pooled provider keys.
+origins_raw = os.environ.get("CORS_ORIGINS", "").strip()
+if origins_raw:
+    allowed_origins = [o.strip() for o in origins_raw.split(",") if o.strip()]
+    _wildcard = "*" in allowed_origins
+    if _wildcard:
+        log.warning("CORS_ORIGINS='*' — allow_credentials force-disabled")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=not _wildcard,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    log.info("CORS disabled (CORS_ORIGINS unset) — same-origin only")
 
 
 @app.on_event("startup")
 def _startup() -> None:
     # Note: deprecated in FastAPI 0.93+ but functional.
     cfg = load_config()
+    validate_security_posture(cfg)
     log.info("Router starting on %s:%s", cfg["server"]["host"], cfg["server"]["port"])
     log.info("  Classifier: %s (%s)", cfg["classifier"]["model"], cfg["classifier"]["base_url"])
     cats = cfg.get("categories", {})
@@ -2309,8 +2411,19 @@ if __name__ == "__main__":
     import uvicorn
 
     cfg = load_config()
-    port = cfg["server"]["port"]
-    host = cfg["server"]["host"]
+
+    # Stage 1: security posture pre-flight — refuse authless starts (fails
+    # closed before uvicorn even binds a socket).
+    validate_security_posture(cfg)
+
+    # Stage 1: localhost is the default bind. Environment overrides exist for
+    # containers (Dockerfile sets ROUTER_HOST=0.0.0.0 intentionally; exposure
+    # is then controlled by the port mapping, not the in-container bind).
+    host = os.environ.get("ROUTER_HOST", "").strip() or cfg["server"].get("host", "127.0.0.1")
+    port = int(os.environ.get("ROUTER_PORT", "").strip() or cfg["server"].get("port", 8766))
+    if host in ("0.0.0.0", "::", ""):  # nosec B104
+        log.warning("Binding to %s — this exposes the router on all interfaces. "  # nosec B104
+                    "If this is not a container, set server.host to 127.0.0.1.", host or "0.0.0.0")  # nosec B104
 
     uvicorn.run(
         "server:app",

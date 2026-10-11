@@ -1,13 +1,14 @@
 {
-  "captured": "2026-10-11T02:55:41Z",
-  "upstream_commit": "0a9560e23d42d0faf6f89afd0fa947ad5b3aad88",
+  "captured": "2026-10-11T02:55:56Z",
+  "upstream_commit": "694f82d9b9b4f2e472978fef576b7ab04b95be8b",
   "router_config": {
     "server": {
       "host": "127.0.0.1",
       "port": 9902
     },
     "auth": {
-      "api_key_env": ""
+      "mode": "required",
+      "api_key_env": "GOLDEN_ROUTER_KEY"
     },
     "classifier": {
       "model": "stub-classifier",
@@ -63,6 +64,8 @@
     "golden_05b_session_cache_hit",
     "golden_06_error_no_user",
     "golden_07_multimodal",
+    "golden_08_unauthorized_no_token",
+    "golden_09_unauthorized_wrong_token",
     "golden_90_health",
     "golden_91_metrics"
   ]

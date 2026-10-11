@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 COPY server.py trace.py surrogate_models.py zero_shot_classifier.py router_config.example.yaml ./
-RUN pip install --no-cache-dir fastapi uvicorn[standard] httpx pyyaml scikit-learn sentence-transformers
+RUN pip install --no-cache-dir fastapi uvicorn[standard] httpx pyyaml cryptography scikit-learn sentence-transformers
 
 # ── Runtime ──────────────────────────────────────────────────────────────────
 FROM python:3.13-slim
@@ -26,6 +26,9 @@ COPY router_config.example.yaml /app/router_config.yaml
 EXPOSE 8766
 
 ENV PYTHONUNBUFFERED=1
+# Stage 1: in-container bind must accept mapped traffic; exposure is
+# controlled by the host port mapping, not this bind.
+ENV ROUTER_HOST=0.0.0.0
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD python3 -c "import httpx; r = httpx.get('http://localhost:8766/health', timeout=5); r.raise_for_status()" || exit 1

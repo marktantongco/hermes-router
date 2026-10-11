@@ -4,6 +4,9 @@
   "request": {
     "method": "POST",
     "path": "/v1/chat/completions",
+    "headers": {
+      "Authorization": "Bearer golden-test-key-0001"
+    },
     "body": {
       "model": "auto",
       "messages": [

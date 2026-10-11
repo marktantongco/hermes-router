@@ -42,12 +42,18 @@ ROUTER_PORT = 9902
 STUB_URL = f"http://127.0.0.1:{STUB_PORT}/v1"
 ROUTER_URL = f"http://127.0.0.1:{ROUTER_PORT}"
 
+# Stage 1: the router now requires bearer auth. The fixture key value is a
+# throwaway test secret (not a real credential) set via GOLDEN_ROUTER_KEY.
+GOLDEN_ROUTER_KEY = "golden-test-key-0001"
+AUTH_HEADER = f"Bearer {GOLDEN_ROUTER_KEY}"
+
 FIXED_CREATED = 1727000000
 FIXED_BODY = "Stub response for golden fixture."
 
 RUNTIME_FILES = [
     "server.py",
     "trace.py",
+    "keystore.py",
     "surrogate_models.py",
     "zero_shot_classifier.py",
     "fasttext_classifier.py",
@@ -171,7 +177,8 @@ def run_scenarios(client: httpx.Client, trace_path: Path) -> list[dict]:
     def record(name: str, description: str, request_body: dict | None,
                path: str, method: str, status: int, body: dict | list | None,
                trace_key: str | None = None, notes: str = "",
-               volatile: bool = False, trace_offset: int = 0) -> None:
+               volatile: bool = False, trace_offset: int = 0,
+               request_headers: dict | None = None) -> None:
         events: list[dict] = []
         if trace_key:
             # Only events appended by THIS request (file is append-only;
@@ -183,7 +190,8 @@ def run_scenarios(client: httpx.Client, trace_path: Path) -> list[dict]:
         fixtures.append({
             "name": name,
             "description": description,
-            "request": {"method": method, "path": path, "body": request_body},
+            "request": {"method": method, "path": path,
+                        "headers": request_headers or {}, "body": request_body},
             "response": {"status": status, "body": body},
             "trace_events": events,
             "volatile": volatile,
@@ -191,28 +199,31 @@ def run_scenarios(client: httpx.Client, trace_path: Path) -> list[dict]:
         })
 
     def post_chat(name: str, description: str, messages: list[dict],
-                  stream: bool = False, notes: str = "") -> None:
+                  stream: bool = False, notes: str = "",
+                  auth_header: str | None = AUTH_HEADER) -> None:
         body = {"model": "auto", "messages": messages, "stream": stream}
         key = session_key(
             messages[0]["content"] if isinstance(messages[0]["content"], str)
             else " ".join(p.get("text", "") for p in messages[0]["content"])
         )
         offset = len(trace_lines())  # events before this request
+        hdrs = {"Authorization": auth_header} if auth_header else {}
         if stream:
             chunks: list[str] = []
             status = 0
-            with client.stream("POST", f"{ROUTER_URL}/v1/chat/completions", json=body) as r:
+            with client.stream("POST", f"{ROUTER_URL}/v1/chat/completions", json=body, headers=hdrs) as r:
                 status = r.status_code
                 for line in r.iter_lines():
                     if line.strip():  # drop empty SSE framing lines
                         chunks.append(line)
             record(name, description, body, "/v1/chat/completions", "POST",
                    status, chunks, key, notes or "SSE transcript, in order",
-                   trace_offset=offset)
+                   trace_offset=offset, request_headers=hdrs)
         else:
-            r = client.post(f"{ROUTER_URL}/v1/chat/completions", json=body)
+            r = client.post(f"{ROUTER_URL}/v1/chat/completions", json=body, headers=hdrs)
             record(name, description, body, "/v1/chat/completions", "POST",
-                   r.status_code, r.json(), key, notes, trace_offset=offset)
+                   r.status_code, r.json(), key, notes, trace_offset=offset,
+                   request_headers=hdrs)
 
     # 01 — override to simple tier, non-streaming
     post_chat("golden_01_simple_nonstream",
@@ -259,24 +270,42 @@ def run_scenarios(client: httpx.Client, trace_path: Path) -> list[dict]:
                   {"type": "text", "text": "/use:complex Describe this image"}]}],
               notes="Upstream replaces str content only; list content keeps override prefix")
 
+    # 08/09 — Stage 1 negative authz (auth is mandatory)
+    r = client.post(f"{ROUTER_URL}/v1/chat/completions", json={"messages": [user_msg("/use:simple hi")]})
+    record("golden_08_unauthorized_no_token",
+           "401 when no Authorization header is presented (auth mandatory)",
+           {"messages": [user_msg("/use:simple hi")]}, "/v1/chat/completions", "POST",
+           r.status_code, r.json(), None,
+           notes="No Authorization header; request never reaches the stub upstream")
+    r = client.post(f"{ROUTER_URL}/v1/chat/completions", json={"messages": [user_msg("/use:simple hi")]},
+                    headers={"Authorization": "Bearer wrong-key-value"})
+    record("golden_09_unauthorized_wrong_token",
+           "401 when a wrong bearer token is presented",
+           {"messages": [user_msg("/use:simple hi")]}, "/v1/chat/completions", "POST",
+           r.status_code, r.json(), None,
+           request_headers={"Authorization": "Bearer [REDACTED-WRONG]"},
+           notes="Wrong token; constant-time comparison rejects; never reaches upstream")
+
     return fixtures
 
 
 def capture_snapshots(client: httpx.Client) -> list[dict]:
     """Health/metrics snapshots — structure-only (values are volatile)."""
     snaps: list[dict] = []
+    # /health is intentionally OPEN (liveness probes carry no credentials)
     r = client.get(f"{ROUTER_URL}/health")
     snaps.append({
         "name": "golden_90_health",
-        "description": "GET /health — structure snapshot (session count volatile)",
-        "request": {"method": "GET", "path": "/health", "body": None},
+        "description": "GET /health — open liveness surface, no auth required",
+        "request": {"method": "GET", "path": "/health", "headers": {}, "body": None},
         "response": {"status": r.status_code,
                      "body": {"status": r.json().get("status"),
                               "sessions_keys": sorted(r.json().keys())}},
         "trace_events": [], "volatile": True,
         "notes": "Body structure only; values vary per capture",
     })
-    r = client.get(f"{ROUTER_URL}/metrics")
+    # /metrics is auth-protected since Stage 1 (operational intel + counters)
+    r = client.get(f"{ROUTER_URL}/metrics", headers={"Authorization": AUTH_HEADER})
     m = r.json().get("metrics", {})
     prom_names = sorted(
         line.split()[0] for line in r.json().get("prometheus", "").splitlines()
@@ -284,8 +313,9 @@ def capture_snapshots(client: httpx.Client) -> list[dict]:
     )
     snaps.append({
         "name": "golden_91_metrics",
-        "description": "GET /metrics — metric key inventory (counters volatile)",
-        "request": {"method": "GET", "path": "/metrics", "body": None},
+        "description": "GET /metrics — auth-protected metric key inventory (counters volatile)",
+        "request": {"method": "GET", "path": "/metrics",
+                    "headers": {"Authorization": "Bearer [set]"}, "body": None},
         "response": {"status": r.status_code,
                      "body": {"metric_keys": sorted(m.keys()),
                               "prometheus_metric_names": prom_names}},
@@ -317,7 +347,8 @@ def main() -> None:
     # 3. Router subprocess (runs upstream server.py unmodified)
     env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp),
            "TRACE_LOG_DIR": str(trace_dir), "TRACE_LOG_ENABLED": "true",
-           "PYTHONUNBUFFERED": "1"}
+           "PYTHONUNBUFFERED": "1",
+           "GOLDEN_ROUTER_KEY": GOLDEN_ROUTER_KEY}
     env.update({k: v for k, v in __import__("os").environ.items()
                 if k.startswith(("LC_", "LANG_"))})
     router_log = open(tmp / "router.stderr.log", "w")

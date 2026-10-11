@@ -1,0 +1,33 @@
+{
+  "name": "golden_09_unauthorized_wrong_token",
+  "description": "401 when a wrong bearer token is presented",
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "Authorization": "Bearer [REDACTED-WRONG]"
+    },
+    "body": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "/use:simple hi"
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 401,
+    "body": {
+      "detail": {
+        "error": {
+          "message": "Invalid or missing API key",
+          "type": "auth_error"
+        }
+      }
+    }
+  },
+  "trace_events": [],
+  "volatile": false,
+  "notes": "Wrong token; constant-time comparison rejects; never reaches upstream"
+}
