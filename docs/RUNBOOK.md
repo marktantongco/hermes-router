@@ -209,10 +209,11 @@ python -m ledger verify --db ledger.sqlite3
 `{"ok": true}` → chain intact. Anything else names the first bad seq and
 reason (field tamper / linkage break / tail truncation).
 
-Disaster recovery drill (repeat quarterly; Stage 8 formalizes it as a
-failure drill): restore yesterday's ledger backup on a scratch machine,
-run `python -m ledger verify`, confirm `ok: true`, then diff
-`/admin/ledger/summary?group_by=day` against the live instance.
+Disaster recovery drill (repeat quarterly; formalized as Drill C in §8.5
+with an automated end-to-end test): restore yesterday's ledger backup
+on a scratch machine, run `python -m ledger verify`, confirm `ok: true`,
+then diff `/admin/ledger/summary?group_by=day` against the live
+instance.
 
 ## 7. Ledger integrity incident (tamper alert)
 
@@ -226,20 +227,107 @@ run `python -m ledger verify`, confirm `ok: true`, then diff
 4. Rotate every credential that had access, then investigate how the file
    was modified (the gateway itself never UPDATEs or DELETEs rows).
 
-## 8. Failure drills (rehearse before Stage 8 freeze)
+## 8. Failure drills (Stage 8 — automated + manual rehearsals)
 
-- **Provider outage**: point a category at a dead URL → observe circuit
-  open (`/dashboard#circuits`), cascade to fallback, `circuit:` alert.
-- **Key exhaustion**: set a pool's keys to a rate-limited stub → 429
-  cooldowns, rotation, then `pool:` alert + synthetic 429 cascade.
-- **Budget exhaustion**: create a VK with a tiny budget → 402 pre-routing,
-  `budget:` critical alert, webhook fired.
-- **Billing leak**: stub a 402 → watchdog event, `billing_leak` alert,
-  `/admin/costguard` shows the event; billing_visibility stays `ok` while
-  appends keep up.
-- **Ledger corruption** (on a COPY): flip a byte in a middle row →
-  `ledger/verify` reports the row; with `ledger_verify: true`, the alert
-  fires on the next evaluation.
+Each drill below has two forms: the **automated drill** (run with
+`python -m pytest tests/test_failure_drills.py -v` — deterministic,
+against the real gateway process) and the **manual rehearsal** for
+production. Run the automated set before every release; rehearse the
+manual forms quarterly.
+
+### 8.1 Provider outage (circuit breaker + cascade)
+
+*Automated*: `TestDrillAProviderOutage` — dead primary URL → circuit
+opens at the shipped threshold (3 consecutive failures) → every client
+request still 200 via the fallback cascade → `circuit:` alert raised +
+webhook delivered → provider revives → half-open trial closes the
+circuit and clears the alert → manual `POST /circuits/reset` drilled
+separately.
+
+*Manual*: point a category's primary at a dead URL (or stop the
+upstream). Watch `/dashboard#circuits` (or `GET /circuits`) open;
+confirm client traffic still succeeds via the fallback model; confirm
+the `circuit:` warning alert on `GET /admin/alerts` and your webhook.
+Restore the provider; after `recovery_timeout_sec` (default 30 s) the
+next request is the half-open trial — confirm the circuit closes. To
+skip the wait, `POST /circuits/reset`.
+
+### 8.2 Key exhaustion (pool cooldowns + synthetic 429 cascade)
+
+*Automated*: `TestDrillBKeyExhaustion` — both pool keys rate-limited:
+the first request takes two raw 429s (cooldowns) and cascades; the
+second finds no available lease and engages the synthetic
+`pool_exhausted` 429 → fallback. `/admin/pools` shows 0 available with
+per-key `consecutive_429`; critical `pool:` alert + webhook; natural
+cooldown recovery; `POST /admin/pools/{name}/unlock` resets 2 keys
+immediately; alert clears.
+
+*Manual*: point the pool's keys at a rate-limited stub (or wait for a
+real rate-limit window). Watch `/admin/pools` cooldowns climb and
+availability drop; confirm clients still 200 via the fallback; confirm
+the `pool:` critical alert. To recover without waiting for the
+cooldown: `POST /admin/pools/{name}/unlock`.
+
+### 8.3 Budget exhaustion (pre-routing 402)
+
+*Automated*: pinned since Stage 5 (`tests/test_costguard.py` +
+fixtures 21a-d) and Stage 6 (`test_dashboard.py` — budget-exhaustion →
+critical alert → webhook → no-double-fire).
+
+*Manual*: create a VK with a tiny budget (`POST /admin/virtual_keys`),
+spend past it, confirm the 402 pre-routing block, the `budget:`
+critical alert, and the webhook. Unblock by raising the budget
+(§4 "Raise a subscriber budget").
+
+### 8.4 Billing leak (watchdog)
+
+*Automated*: pinned since Stage 5 (fixtures 22a-c, 24a) — an upstream
+402/401 the ledger never billed becomes a watchdog event and a
+`billing_leak` alert; `billing_visibility` stays `ok` while appends
+keep up.
+
+*Manual*: stub a 402 upstream response, confirm
+`GET /admin/costguard` shows the event and the alert fires.
+
+### 8.5 Ledger corruption + recovery (R9 drill)
+
+*Automated*: `TestDrillCLedgerCorruption` — the full §6/§7 procedure
+end-to-end: online backup → stop → tamper a middle row's cost →
+offline `python -m ledger verify --db` exits 1 naming `first_bad_seq`
+→ restart boots (detection, not refusal) with `/admin/ledger/verify`
+red and the `ledger_verify` critical alert + webhook → stop → restore
+the backup (remove `-wal`/`-shm` sidecars) → start → chain green,
+history intact, appending resumes with seq continuity.
+
+*Manual*: rehearse §6's disaster-recovery drill quarterly on a scratch
+machine — never on the live ledger file.
+
+### 8.6 The 24-hour soak (release + quarterly)
+
+The in-suite soak (`tests/test_load_soak.py`) proves the failure
+lattice deterministically in a compressed window; the 24-hour run is
+this procedure, driven by `tools/soak.py` (stdlib-only — no installs
+on the deployed host):
+
+```bash
+python tools/soak.py --url http://127.0.0.1:8000 \
+    --key "$ROUTER_KEY" --duration 24h --concurrency 24 \
+    --report soak_$(date +%F)
+echo "exit=$?"   # 0 = PASS
+```
+
+* Before every release tag and quarterly in production.
+* Traffic mix defaults to 70% streaming / 30% non-stream; every request
+  carries a unique marker and streams are reassembled client-side, so
+  cross-stream corruption and half-read streams are counted as errors.
+* The sampler records the alerting heartbeat timeline
+  (`/admin/status`) into the report.
+* **Pass criteria** (exit 0): zero 5xx, error rate within
+  `--max-error-rate` (default 0.0), zero incomplete bodies. Relax the
+  rate only for deliberate fault-injection soaks, and say so in the
+  report's margin.
+* Reports: `soak_<date>.json` (full timeline) + `.md` (summary) —
+  file both with the release evidence.
 
 ## 9. Security notes (Stage 1 posture, still true)
 

@@ -1,6 +1,6 @@
 {
-  "captured": "2026-10-11T21:09:06Z",
-  "upstream_commit": "bee8169ecfd4f68b65ccb60fadeb5e6740dcdeb9",
+  "captured": "2026-10-12T06:37:54Z",
+  "upstream_commit": "c06a2f6b647498f2a0ea163ef9ebf3128f79550c",
   "router_config": {
     "server": {
       "host": "127.0.0.1",
@@ -249,6 +249,7 @@
     "Stage 5: scenarios 21-24 pin the cost guard — principal request/token limiter boundaries (VK_D/VK_E with reconciliation proof), pool-scope gate (guard_pool) and the injected-402 watchdog; snapshot 93 pins the /admin/costguard state (VK_D/VK_E labels, ts scrubbed)",
     "Stage 6: snapshot 94 pins the first alert evaluation (budget:VK_C exhausted + billing_leak from 24a, both critical, raised_now == active); snapshot 95 pins the dashboard structure contract (section ids, zero-asset rule); /metrics gains the alerts_* counter family while the alerts section is enabled",
     "Stage 7: snapshot 96 pins the /v1/models ingress surface (OpenAI list shape, deduplicated ids, hermes_router tier metadata) consumed by the Hermes agent and the model-provider plugin",
+    "Stage 8: zero behavior deltas — the finally-guarded stream ledger append (billing completeness on client disconnect, found by the Stage 8 load gate) is invisible to this sequential harness, which consumes streams to exhaustion; all 46 fixtures re-verified byte-identical",
     "Re-capture at every stage boundary; diff = behavior regression signal"
   ],
   "fixtures": [

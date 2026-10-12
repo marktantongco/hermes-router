@@ -985,6 +985,11 @@ def main() -> None:
                 "(OpenAI list shape, deduplicated ids, hermes_router tier "
                 "metadata) consumed by the Hermes agent and the "
                 "model-provider plugin",
+                "Stage 8: zero behavior deltas — the finally-guarded stream "
+                "ledger append (billing completeness on client disconnect, "
+                "found by the Stage 8 load gate) is invisible to this "
+                "sequential harness, which consumes streams to exhaustion; "
+                "all 46 fixtures re-verified byte-identical",
                 "Re-capture at every stage boundary; diff = behavior regression signal",
             ],
             "fixtures": [f["name"] for f in fixtures],

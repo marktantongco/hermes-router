@@ -625,6 +625,38 @@ cat traces/router-trace-*.jsonl | jq 'select(.event=="circuit" and .new_state=="
 
 ---
 
+## Release v1.0.0 (Stage 8 freeze)
+
+The D2 v1 plan (Stages 0–8) is complete and frozen; the release
+manifest is [`docs/RELEASE.md`](docs/RELEASE.md) (gate results, the
+risk-register re-score, known limitations, and the one open owner
+decision — the root LICENSE file).
+
+Stage 8 added the hardening plane:
+
+* **Load / soak** — `tests/test_load_soak.py` pins exact billing under
+  32-way concurrent streaming (it found and closed a real
+  billing-completeness gap: streams cancelled at the final `[DONE]`
+  frame could skip their cost record), plus a deterministic compressed
+  soak over the rotation/exhaustion/recovery lattice.
+* **Failure drills** — `tests/test_failure_drills.py` drills the three
+  dossier lifecycles end-to-end: provider outage (circuit → cascade →
+  alert → half-open recovery → manual reset), key exhaustion
+  (cooldowns → synthetic 429 cascade → alert → unlock), and ledger
+  corruption + the R9 backup/restore procedure. Manual rehearsal
+  procedures: [RUNBOOK §8](docs/RUNBOOK.md).
+* **24-hour soak driver** — `tools/soak.py` (stdlib-only):
+
+  ```bash
+  python tools/soak.py --url http://127.0.0.1:8000 --key "$ROUTER_KEY" \
+      --duration 24h --concurrency 24 --report soak_$(date +%F)
+  ```
+
+All golden fixtures (46) re-verified byte-identical at freeze; the
+full gate stack (ruff / mypy / bandit / pip-audit / pytest) is green.
+
+---
+
 ## License
 
 MIT

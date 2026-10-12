@@ -5,8 +5,8 @@
 
 [project]
 name = "hermes-router-proxy"
-version = "0.1.0"
-description = "Unified Hermes gateway - Stage 0 baseline (fork of kjames2001/hermes-router-proxy)"
+version = "1.0.0"
+description = "Unified Hermes gateway - v1.0.0 (Stage 8 freeze; fork of kjames2001/hermes-router-proxy)"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.141.1",

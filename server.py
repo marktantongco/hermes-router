@@ -2337,6 +2337,11 @@ async def route_request_stream(cfg: dict, payload: dict,
                                                 )
                                                 if attempt_label != "primary":
                                                     _inc_metric("fallback_used_total" if attempt_label == "fallback1" else "fallback2_used_total")
+                                                # Stage 8: same finally-guard
+                                                # as the main pump — the retry
+                                                # lane is also a generator that
+                                                # can be cancelled at a yield.
+                                                retry_ledger_written = False
                                                 try:
                                                     retry_sniffer = _UsageSniffer(
                                                         provider.open_stream_translator(payload, attempt_cfg))
@@ -2351,6 +2356,7 @@ async def route_request_stream(cfg: dict, payload: dict,
                                                         vk_id=virtual_key_id,
                                                         usage=retry_sniffer.usage,
                                                         status="ok", cg_ticket=cg_ticket)
+                                                    retry_ledger_written = True
                                                     _clear_retry(key)
                                                     return  # clean completion
                                                 except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as stream_exc:
@@ -2362,6 +2368,7 @@ async def route_request_stream(cfg: dict, payload: dict,
                                                         vk_id=virtual_key_id,
                                                         usage=None, status="interrupted",
                                                         cg_ticket=cg_ticket)
+                                                    retry_ledger_written = True
                                                     log.warning("Stream interrupted for %s after 503 retry: %s", model_name, stream_exc)
                                                     cnt = _record_failure(key)
                                                     trace_stream_error(
@@ -2369,6 +2376,16 @@ async def route_request_stream(cfg: dict, payload: dict,
                                                         error=str(stream_exc), failure_count=cnt, max_failures=3,
                                                     )
                                                     break  # mid-stream break after 503 retry, try next tier
+                                                finally:
+                                                    if not retry_ledger_written:
+                                                        _ledger_append(
+                                                            session_key=key,
+                                                            attempt_cfg=attempt_cfg,
+                                                            stream=True, key_id=key_label,
+                                                            fallback_level=attempt_level,
+                                                            vk_id=virtual_key_id,
+                                                            usage=None, status="interrupted",
+                                                            cg_ticket=cg_ticket)
                                             elif retry_resp.status_code == 429:
                                                 _ = await retry_resp.aread()
                                                 # 429 on retry — record and break to next key/tier
@@ -2416,6 +2433,12 @@ async def route_request_stream(cfg: dict, payload: dict,
                         if attempt_label != "primary":
                             _inc_metric("fallback_used_total" if attempt_label == "fallback1" else "fallback2_used_total")
 
+                        # Stage 8: billing completeness cannot depend on
+                        # socket teardown racing the event loop — a client
+                        # that disconnects at the final [DONE] yield cancels
+                        # this generator before the append below runs. The
+                        # finally-guard writes the record regardless.
+                        ledger_written = False
                         try:
                             sniffer = _UsageSniffer(
                                 provider.open_stream_translator(payload, attempt_cfg))
@@ -2429,6 +2452,7 @@ async def route_request_stream(cfg: dict, payload: dict,
                                 vk_id=virtual_key_id,
                                 usage=sniffer.usage, status="ok",
                                 cg_ticket=cg_ticket)
+                            ledger_written = True
                             _clear_retry(key)
                             return  # clean completion
 
@@ -2441,6 +2465,7 @@ async def route_request_stream(cfg: dict, payload: dict,
                                 vk_id=virtual_key_id,
                                 usage=None, status="interrupted",
                                 cg_ticket=cg_ticket)
+                            ledger_written = True
                             log.warning("Stream interrupted for %s: %s", model_name, stream_exc)
                             cnt = _record_failure(key)
                             trace_stream_error(
@@ -2450,6 +2475,18 @@ async def route_request_stream(cfg: dict, payload: dict,
                             )
                             yield b'data: [DONE]\n\n'
                             return  # gateway's HERMES_STREAM_RETRIES handles retry
+                        finally:
+                            if not ledger_written:
+                                # Cancelled/closed at a yield (client vanished
+                                # mid-stream or right after [DONE]) — the cost
+                                # record still lands, flagged interrupted.
+                                _ledger_append(
+                                    session_key=key, attempt_cfg=attempt_cfg,
+                                    stream=True, key_id=key_label,
+                                    fallback_level=attempt_level,
+                                    vk_id=virtual_key_id,
+                                    usage=None, status="interrupted",
+                                    cg_ticket=cg_ticket)
 
                 except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as exc:
                     log.warning("Streaming %s transport error: %s", model_name, exc)
