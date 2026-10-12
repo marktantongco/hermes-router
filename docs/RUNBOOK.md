@@ -70,10 +70,20 @@ Requirements before first start:
 
 ### Bare metal / systemd
 
-`router-config/systemd/hermes-router.service` runs `server.py` under a
-dedicated user. Install, `systemctl daemon-reload`, `systemctl enable
---now hermes-router`. The server binds `127.0.0.1` by default
-(`ROUTER_HOST`/`ROUTER_PORT` override; binding `0.0.0.0` outside a
+The installer does the whole path — preflight, venv, pinned runtime,
+config from the annotated example, a generated gateway key in
+`router.env` (0600), the hardened systemd unit, and a boot check:
+
+```bash
+bash install.sh                    # /opt/hermes-router (root) or ~/.hermes-router
+bash install.sh doctor             # post-install health report
+bash install.sh uninstall          # stops, removes code, preserves state by default
+```
+
+Manual equivalent: install `router-config/systemd/hermes-router.service`
+(after substituting `@HERMES_HOME@`), `systemctl daemon-reload`,
+`systemctl enable --now hermes-router`. The server binds `127.0.0.1` by
+default (`ROUTER_HOST`/`ROUTER_PORT` override; binding `0.0.0.0` outside a
 container logs a loud warning by design).
 
 ## 3. First boot checklist

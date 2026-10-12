@@ -2,7 +2,7 @@
 
 **Release**: v1.0.0 (Stage 8 freeze) · **Date**: 2026-10-12
 **Base**: fork of kjames2001/hermes-router-proxy @ `0a9560e`
-( MIT-by-file-header-claim; root LICENSE pending owner decision — §6 )
+(MIT — upstream file-header claims; root LICENSE resolved at publication, §6)
 **Scope**: the approved D2 v1 plan (Stages 0–8), delivered as nine
 revertible stage commits on `stage-0-baseline`, tagged `v1.0.0`.
 
@@ -99,18 +99,26 @@ operational watch-item (quarterly catalog/terms review, RUNBOOK §4).
 ## 6. Known limitations & open owner decision
 
 1. **24-hour soak** is an operator procedure (`tools/soak.py`,
-   RUNBOOK §8.6), live-smoked in-suite; the in-suite proof is the
-   compressed deterministic window (Stage 6/7 layering precedent).
+   RUNBOOK §8.6). At publication a **real 60-minute release soak** was
+   executed against a production-shaped deployment of the frozen
+   runtime — **PASS**: 211,287 requests at concurrency 24 (70%
+   streaming), 100% HTTP 200, zero incomplete bodies, 212,896-record
+   HMAC ledger verified intact, bounded RSS/fds; evidence in
+   `docs/soak/`. The full 24-hour run is launched per §8.6 as the
+   standing release/quarterly procedure (the in-suite compressed
+   window remains the deterministic proof of the failure lattice).
 2. **Docker compose deploy** is validated by a 14-test structural
    contract; the deploy-time step is documented in the runbook (docker
    is unavailable in the CI sandbox).
 3. **Live local Ollama lane** (4 tests) auto-skips without a local
    runtime; the manual procedure is HERMES_INTEGRATION §8/§10.
-4. **Root LICENSE file**: file headers claim MIT but no root LICENSE
-   exists upstream; explicitly deferred to owner instruction at Stage
-   0. This remains the one open owner decision at v1.0.0. It does not
-   block the tag by prior instruction; it should be resolved before
-   any redistribution beyond the owner's own deployment.
+4. **Root LICENSE file**: **RESOLVED at publication** — the root
+   `LICENSE` (MIT, dual attribution: upstream James Huang @ `0a9560e`;
+   this fork) now makes explicit the grant every file header has claimed
+   since Stage 0. MIT is the only license consistent with the upstream
+   header claims and the R4 anti-contamination posture; no relicense
+   occurred. This closes the Stage-0 owner decision and clears the
+   redistribution precondition.
 5. **`/admin/ledger/records` `total`** is the unfiltered count (Stage 4
    shape, fixture-pinned); filtered pagination is available via the
    returned `records` page. Noted for a future minor release.

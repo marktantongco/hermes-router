@@ -1,18 +1,29 @@
 [Unit]
-Description=Hermes Model Router (flash-classifier + keyword-pipe proxy)
+Description=hermes-router — hardened LLM gateway (v1.0.0)
+Documentation=https://github.com/marktantongco/hermes-router
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/root/.hermes/hermes-agent/venv/bin/python /root/router-proxy/server.py
-WorkingDirectory=/root/router-proxy
-EnvironmentFile=%h/.hermes/.env
+# Paths are substituted by install.sh (@HERMES_HOME@).
+WorkingDirectory=@HERMES_HOME@
+EnvironmentFile=@HERMES_HOME@/router.env
+ExecStart=@HERMES_HOME@/venv/bin/python @HERMES_HOME@/server.py
 Restart=on-failure
 RestartSec=10
 KillMode=process
 KillSignal=SIGTERM
 TimeoutStopSec=10
 
+# Stage 1 posture, enforced by the unit:
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@HERMES_HOME@/.router
+RestrictSUIDSGID=true
+LockPersonality=true
+
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

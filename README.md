@@ -1,200 +1,184 @@
-# Hermes Router-Proxy
+# hermes-router
 
-An intelligent LLM routing proxy that classifies prompts as "simple" or "complex" using a cheap local model, then transparently routes them to the right cloud model. **OpenAI API-compatible** — drop it in front of any OpenAI-compatible client.
+**A production-hardened, self-hosted LLM gateway.** One OpenAI-compatible endpoint in front of every provider you use: it classifies conversations and routes each one to the right model chain, rotates provider keys, enforces per-subscriber budgets, writes an immutable cost ledger, and watches itself with alerts and a zero-asset dashboard.
 
-**The idea:** Not every query needs your most expensive model. Simple questions (chat, trivia, definitions) go to a fast/cheap model. Hard questions (code, debug, deploy) go to a smart/expensive model. A small classifier handles routing with ~200ms overhead.
+[![CI](https://github.com/marktantongco/hermes-router/actions/workflows/ci.yml/badge.svg)](https://github.com/marktantongco/hermes-router/actions/workflows/ci.yml)
+[![tests](https://img.shields.io/badge/tests-491%20passed%20%2B%204%20skipped-brightgreen)](#testing--quality-gates)
+[![release](https://img.shields.io/badge/release-v1.0.0-blue)](docs/RELEASE.md)
+[![python](https://img.shields.io/badge/python-3.12%2B-blue)](pyproject.toml)
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-**Tested results** with `qwen2.5:3b` on Ollama: **9/10 accuracy**, **~200ms classification overhead**.
+Hardened fork of [kjames2001/hermes-router-proxy](https://github.com/kjames2001/hermes-router-proxy) (pinned `0a9560e`), rebuilt through nine exit-gated engineering stages: security hardening, provider abstraction, key pooling, an immutable billing ledger, cost-guard admission control, an operations plane, Hermes integration, and a load/soak/failure-drill freeze — **491 tests + 4 skipped pin the v1.0.0 surface, including 46 byte-stable golden fixtures and the docs themselves.**
 
----
+![Architecture](docs/assets/architecture.png)
+
+## Why
+
+* **Not every query needs your most expensive model** — a flash classifier sends chat to a cheap model and code to a strong one, decided once per session at sub-millisecond cost.
+* **Providers fail; your endpoint shouldn't** — per-endpoint circuit breakers, key pools with 429-aware cooldowns, and cross-protocol fallback chains turn outages into a reroute.
+* **Spend must be provable** — one hash-chained cost record per completion, integer-exact micro-USD, budgets that block *before* the upstream call (`402`, not an invoice surprise).
+* **Self-hosted means self-watched** — dashboard, Prometheus metrics, alert rules with webhooks, and a 24-hour soak driver shipped in the box.
+
+## Contents
+
+* [Quick start](#quick-start) — installer, Docker, or source
+* [How it works](#how-it-works) — routing pipeline + request lifecycle
+* [Configuration](#configuration) — the full annotated reference
+* [API endpoints](#api-endpoints) — the complete surface (parity-tested)
+* [Operations](#operations) — dashboard, metrics, alerts
+* [Testing & quality gates](#testing--quality-gates)
+* [Release v1.0.0](#release-v100-stage-8-freeze) — manifest, soak evidence
+* [Documentation](#documentation) — runbook, architecture, walkthrough, stage memos
+* [Project layout](#project-layout)
+* [Contributing](#contributing) · [Security](#security) · [License](#license)
+
+## Quick start
+
+**Path A — bare metal, the installer (recommended).** Preflight, venv, pinned runtime, config from the annotated example, a generated gateway key, hardened systemd unit, boot verification — one command, idempotent:
+
+```bash
+git clone https://github.com/marktantongco/hermes-router.git
+cd hermes-router
+sudo bash install.sh            # → /opt/hermes-router + systemd (or: --home DIR, --no-service)
+bash install.sh doctor          # post-install health report any time
+```
+
+**Path B — Docker (hardened compose profile):**
+
+```bash
+docker compose config           # validate (structure pinned by tests/test_deploy.py)
+docker compose up -d            # loopback bind, caps, read-only rootfs, state volume
+curl -fsS localhost:8766/health
+```
+
+**Path C — from source (development):**
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install -e ".[dev]"
+pytest                          # the full frozen surface, green
+python server.py                # auth is MANDATORY — see Configuration
+```
+
+**First request** (the gateway key is in `router.env` after an installer run):
+
+```bash
+curl -s -H "Authorization: Bearer $ROUTER_PROXY_API_KEY" \
+     -H "Content-Type: application/json" \
+     -d '{"model":"auto","messages":[{"role":"user","content":"hello!"}]}' \
+     http://127.0.0.1:8766/v1/chat/completions
+```
+
+Point any OpenAI SDK at `base_url = http://your-host:8766/v1` — that is the entire client-side change. New to the project? The [walkthrough](docs/WALKTHROUGH.md) takes a fresh host to a fully drilled production deployment, step by step.
 
 ## Features
 
-- **Smart classification** — Uses a local flash model (e.g., `qwen2.5:3b` via Ollama) to classify each new prompt as `simple` or `complex`
-- **TRACER surrogate classifier** — Offline-learned surrogate model (TF-IDF or MiniLM-L6-v2 embeddings) that handles 90%+ of classifications locally with ~1ms latency and zero LLM cost. Trained on production trace data with teacher agreement gating. Weekly auto-refit via cron
-- **Sentence embeddings** — When `sentence-transformers` is installed, `all-MiniLM-L6-v2` (384-dim) embeddings provide richer semantic representations for the surrogate. Auto-selected with `--prefer-embeddings` flag
-- **`/classifier/report` endpoint** — Live dashboard showing surrogate coverage, confidence distribution, per-model routing stats, hourly drift timeline, and fallback usage. Supports `?format=html` for dark-themed visualization
-- **Session awareness** — Classifies only the first message in a conversation. Follow-ups reuse the cached tier with sub-millisecond keyword deviation detection
-- **Keyword overrides** — "implement", "debug", "deploy" always route complex. "thanks", "lol", "how are you" always route simple. These bypass the classifier entirely
-- **Fuzzy keyword matching** — Typo-tolerant keyword detection using normalized substring matching and Levenshtein distance (≤1 edit)
-- **OpenAI-compatible endpoint** — Drop-in replacement at `POST /v1/chat/completions`. Works with any OpenAI SDK, Hermes Agent, or compatible client
-- **Full multimodal support** — Handles image+text payloads (array content messages)
-- **Health endpoint** — `GET /health` for liveness checks and session count monitoring
+- **Smart classification** — a local flash model classifies each new conversation into a task category; follow-ups reuse the cached tier with sub-millisecond keyword deviation detection
+- **5-tier classifier ladder (cheapest first)** — fastText (<0.01 ms) → SetFit (~10 ms) → zero-shot embeddings → offline-learned ML surrogate (~0.1 ms, zero LLM cost) → LLM flash fallback; each tier yields at its confidence threshold
+- **`/classifier/report` endpoint** — surrogate coverage, confidence distribution, routing stats, hourly drift timeline; `?format=html` for a dark-themed dashboard
+- **Session awareness** — classify once per conversation (session key = hash of the first user message), 5-minute TTL, re-classification only on keyword deviation or `/use:<category>` override
+- **Provider abstraction (Stage 2)** — `openai` adapter (any `/v1` endpoint: OpenAI, Ollama, vLLM, LM Studio, llama.cpp, …) + `anthropic` adapter (Messages API with full translation, streaming SSE synthesis, tool calls); fallbacks may cross protocols
+- **Key pooling (Stage 3)** — round-robin over your own keys with capability tags; 429 cooldowns read from the provider's own retry headers; 401/403 quarantine with operator unlock; a seven-tier free-tier catalog with an atomic refresh job
+- **Immutable cost ledger (Stage 4)** — one hash-chained record per completion (SHA-256, optional HMAC), integer micro-USD from pinned price snapshots, virtual keys with blocking budgets (`402` before any upstream spend)
+- **Cost guard (Stage 5)** — true sliding-window limiters in principal / pool / global scopes (requests or tokens), estimate-to-actual reconciliation, burst-smoothing pacer, billing-leak watchdog
+- **Operations plane (Stage 6)** — zero-asset admin dashboard, six alert rules with webhook delivery, Prometheus metrics, hardened compose profile, full runbook
+- **Hermes integration (Stage 7)** — `GET /v1/models` discovery surface plus an optional model-provider plugin
+- **Hardening & freeze (Stage 8)** — 32-way concurrent-stream load gate, compressed soak over the failure lattice, three end-to-end failure drills, documentation frozen *as tests*
+- **Streaming done right** — transparent SSE passthrough with `[DONE]` handling, usage frames, 503 mid-stream retry, and finally-guarded cost records so a client disconnecting at the last frame still lands its billing row
 
-### Resilience
+## How it works
 
-- **Multi-tier fallback cascade** — Primary → fallback1 → fallback2, each with independent base URL and API key
-- **API key rotation** — Automatic retry with alternate keys on HTTP 429 at every tier (primary, fallback1, fallback2)
-- **503 retry with exponential backoff** — Sync path retries HTTP 503 up to 3x (2s/4s/8s) before escalating
-- **Transport retry** — Retryable errors (ConnectError, RemoteProtocolError, ReadTimeout, ConnectTimeout) retry up to 3x with 1s backoff
-- **Circuit breakers** — Per-endpoint breaker trips after N consecutive 429s/5xx, recovers automatically after a configurable timeout (half-open state)
+### The request lifecycle
 
-### Streaming Resilience (Transparent Proxy)
+![Request lifecycle](docs/assets/request_lifecycle.png)
 
-The router-proxy acts as a **transparent SSE proxy** — no internal retry loops on the streaming path:
+Six phases, each with its gate — authentication, policy (budget + rate windows), routing decision, upstream dispatch with cascade, billing append, response + observation. The full element-by-element reference (purpose and function of every component) is [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-- **Clean cut on failure** — When the inner stream breaks, the outer SSE is immediately closed with `data: [DONE]`. No backoff, no silence.
-- **Delegated retry** — The Hermes gateway's own `HERMES_STREAM_RETRIES` mechanism detects the clean close and reconnects with a fresh request.
-- **3-strike fallback** — A per-session failure counter tracks consecutive breaks. Only after **3 consecutive failures** does the next gateway retry skip the primary model and go directly to fallback. This means the router tries hard to reconnect to the primary (like a direct connection would), only downgrading when the endpoint is genuinely unhealthy.
-- **Auto-recovery** — A successful stream immediately resets the counter to zero.
-
-### Observability
-
-- **Prometheus-compatible metrics** — `GET /metrics` with counters for requests by tier, classifier calls/latency, cache hits, 429s by tier, fallback usage, streaming requests, errors, active sessions, open circuits
-- **JSON structured logging** — `LOG_FORMAT=json` env var enables one-line JSON logs for both router and uvicorn
-- **Structured JSONL trace logging** — Every routing decision (classify, cache hit, deviation, fallback, circuit breaker, key rotation) is emitted as a JSON line to a date-stamped trace file. Enables full audit trail and post-hoc analysis of classifier behavior. See [Trace Logging](#trace-logging) below.
-- **Admin API** — `POST /reload` (hot-reload config without restart), `GET/DELETE /admin/sessions` (inspect/evict cached sessions), `GET /admin/config` (inspect live config), `GET /circuits` + `POST /circuits/reset` (circuit breaker management)
-
-### Security & Compatibility
-
-- **CORS** — Configurable via `CORS_ORIGINS` env var (defaults to `*`)
-- **API key auth** — `ROUTER_PROXY_API_KEY` env var protects admin/metrics/circuit endpoints; `/health` always open, `/v1/chat/completions` optional
-- **Profile-aware classification** — Reads both `USER.md` and `MEMORY.md` (your agent persona + durable memory) and injects a 2–3 sentence summary into the classifier prompt
-
----
-
-## Architecture
-
-```
-User → Hermes Agent → router-proxy (localhost:8766)
-                           │
-                    ┌──────┴──────┐
-                    │  classifier  │
-                    │  (2-stage)   │
-                    │              │
-                    │ surrogate    │ ← ~1ms, zero-cost
-                    │ ↓ (low conf) │
-                    │ qwen2.5:3b   │ ← ~200ms fallback
-                    └──────┬──────┘
-                           │
-              ┌────────────┴────────────┐
-              ↓                         ↓
-        simple model              complex model
-   (e.g. deepseek-v4-flash)    (e.g. deepseek-v4-pro)
-                                   │
-              ┌────────────────────┼────────────────────┐
-              ↓                    ↓                    ↓
-        fallback1             fallback2            alt keys
-   (e.g. glm-5.1)         (e.g. big-pickle)     (key rotation)
-```
-
----
-
-## How It Works
-
-### Routing Pipeline
-
-1. **New session** — First message is sent to the flash classifier model. It reads the prompt (with a profile hint from `USER.md` + `MEMORY.md`) and returns `simple` or `complex`. The tier is cached with a configurable timeout.
-
-2. **Follow-up messages** — The cached tier is reused instantly. The router scans for escalation keywords (e.g., "fix", "error", "why doesn't this work") or de-escalation keywords (e.g., "thanks", "ok"). If a keyword is detected, it re-classifies and potentially switches tiers mid-conversation.
-
-3. **Model call** — The request payload (with full message history) is forwarded to the appropriate model endpoint. The `model` field in the payload is overwritten to match the routed model.
-
-4. **Fallback cascade** — If the primary model fails, the request retries against fallback1. If that also fails, fallback2 is tried. If all fail, a 502 error is returned with upstream context.
-
-5. **Key rotation at every tier** — If any tier returns HTTP 429, the alternate key for that tier is tried automatically before falling through.
-
-6. **Circuit breakers** — After N consecutive 429s from an endpoint within a sliding window, the circuit opens and that endpoint is skipped entirely for X seconds (configurable recovery timeout). After recovery, a single success in half-open state closes the circuit.
-
-### Session Lifecycle
+### Session lifecycle
 
 ```
 ┌─────────────┐     ┌─────────────┐     ┌──────────────┐
 │ "What time  │     │ "Also, can  │     │ "Actually,   │
-│  is it?"    │────▶│  you write  │────▶│  write a      │
-│ → simple    │     │  me a bash  │     │  deployment   │
-│  (cached)   │     │  script?"   │     │  script?"     │
+│  is it?"    │────▶│  you write  │────▶│  write a     │
+│ → chat      │     │  me a bash  │     │  deployment  │
+│  (cached)   │     │  script?"   │     │  script?"    │
 └─────────────┘     │ → keyword   │     │ → keyword    │
                     │   deviation │     │   deviation  │
-                    │   detected  │     │   detected   │
                     │ → reclass   │     │ → reclass    │
-                    │ → complex   │     │ → complex    │
+                    │ → code      │     │ → devops     │
                     └─────────────┘     └──────────────┘
 ```
 
-Sessions expire after a configurable timeout (default: 5 minutes), triggering re-classification on the next message.
+Sessions expire after a configurable timeout (default: 5 minutes), triggering re-classification on the next message. The model `auto` means "route by classification"; `/use:<category>` forces a category for one message.
 
----
+### The layered build
 
-## Setup
+![Layered build](docs/assets/layers.png)
 
-```bash
-# Clone
-git clone https://github.com/kjames2001/hermes-router-proxy.git
-cd hermes-router-proxy
-
-# Copy and edit config
-cp router_config.example.yaml router_config.yaml
-# Edit router_config.yaml with your models and API keys
-
-# Install dependencies
-pip install httpx uvicorn fastapi pyyaml
-
-# Run
-python server.py
-```
-
-### Systemd Service
-
-```bash
-sudo cp router-config/systemd/hermes-router.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now hermes-router
-```
+Nine gated stages, each a revertible commit with its own memo — the audit trail is [RELEASE.md §2](docs/RELEASE.md). A stage closed only when ruff, mypy, bandit, pip-audit and pytest were all green and the golden fixtures stayed byte-identical.
 
 ---
 
 ## Configuration
 
-See `router_config.example.yaml` for the full annotated template. Key sections:
+Configuration is a single YAML file (`router_config.yaml`, auto-detected next to `server.py`; hot-reload with `POST /reload`). The complete annotated template is [`router_config.example.yaml`](router_config.example.yaml). Key sections:
 
 ### Server
 
 ```yaml
 server:
-  host: "127.0.0.1"
+  host: "127.0.0.1"     # Stage 1 posture: localhost by default (Dockerfile sets 0.0.0.0)
   port: 8766
 ```
+
+### Auth (Stage 1 — mandatory, fail-closed)
+
+```yaml
+auth:
+  mode: required            # the default; 'disabled' is explicit dev-only
+  api_key_env: ROUTER_PROXY_API_KEY   # env NAME or ks:<keystore-alias>
+```
+
+The server **refuses to boot** with `mode: required` and a missing/unresolvable key. Clients send `Authorization: Bearer <key>`. Virtual keys (`vk-…`, issued via the admin API) may call `/v1/chat/completions` only — every admin surface answers `403 admin_only`. Provider keys live in the encrypted keystore (`python -m keystore`) or env files; logs are scrubbed by a redaction filter.
 
 ### Classifier
 
 ```yaml
 classifier:
-  model: "qwen2.5:3b"
+  model: "qwen2.5:3b"           # any fast flash model
   base_url: "http://localhost:11434/v1"
-  api_key_env: ""              # Ollama doesn't need auth
-  session_timeout_minutes: 5   # Cache expiry
-  system_prompt: "..."          # Classification prompt template
-  profile_hint: ""              # Auto-filled from USER.md + MEMORY.md on first run
+  api_key_env: ""               # Ollama doesn't need auth
+  session_timeout_minutes: 5    # cache expiry
+  system_prompt: "..."          # classification prompt template
+  profile_hint: ""              # auto-filled from USER.md + MEMORY.md on first run
+  fasttext:  {enabled: false}   # each local tier is independently toggleable
+  setfit:    {enabled: false}
+  surrogate: {enabled: false}
+  zero_shot: {enabled: false}
 ```
 
-### Models (with fallback cascade + key rotation)
+### Categories — your routing table
+
+Any number of task categories; each maps to a model with up to two fallbacks and either a single key (`api_key_env`) or a key pool (`key_pool`). The legacy two-tier `models: simple/complex` format is auto-migrated on load.
 
 ```yaml
-models:
-  simple:
-    model: "deepseek-v4-flash"
-    base_url: "https://api.example.com/v1"
-    api_key_env: "PROVIDER_API_KEY"
-    alternate_key_env: ""          # Optional — key rotation on 429
-    fallback_model: "gpt-4o-mini"  # Optional fallback1
-    fallback_base_url: "https://api.openai.com/v1"
-    fallback_key_env: "OPENAI_API_KEY"
-    fallback_alternate_key_env: "" # Optional — key rotation on fallback1 429
-    fallback2_model: "claude-haiku" # Optional fallback2 (last resort)
-    fallback2_base_url: "https://api.anthropic.com/v1"
-    fallback2_key_env: "ANTHROPIC_API_KEY"
-    fallback2_alternate_key_env: "" # Optional — key rotation on fallback2 429
-    timeout_seconds: 120
-
-  complex:
+categories:
+  code:
+    label: "Code & Debug"
     model: "deepseek-v4-pro"
-    # ... same structure as simple
+    base_url: "https://ollama.com/v1"
+    api_key_env: "OLLAMA_API_KEY"
+    alternate_key_env: ""            # optional — key rotation on 429
+    timeout_seconds: 300
+    fallback_model: "deepseek-v4-pro"      # optional fallback 1
+    fallback_base_url: "https://api.deepseek.com/v1"
+    fallback_key_env: "DEEPSEEK_API_KEY"
+    fallback2_model: ""               # optional last resort
+    fallback2_base_url: ""
+    fallback2_key_env: ""
 ```
 
-### Provider Adapters (Stage 2)
-
-Every category (and each fallback) dispatches through a **provider adapter** selected by `provider:`. The external surface stays OpenAI-compatible; translation lives upstream-side.
+### Provider adapters (Stage 2)
 
 | Provider | Protocol | Use for |
 |----------|----------|---------|
@@ -216,7 +200,27 @@ categories:
 
 Introspect the live registry and per-category resolution at `GET /admin/providers` (auth required). Trace `route` events carry `provider` attribution; non-default providers annotate success responses with `hermes_router.provider`. Adapter limitations (documented in `providers.py`): unsupported OpenAI fields (`n`, `logprobs`, `response_format`, ...) are dropped with a debug log; `tool_choice: "none"` drops tools entirely; images accept data URIs and http(s) URLs.
 
-### Billing Plane (Stage 4)
+### Key pools (Stage 3)
+
+A pool rotates several of **your own** keys for one endpoint: round-robin leasing with capability filters, cooldowns on 429 taken from the provider's own retry headers (`Retry-After`, `x-ratelimit-reset`), bounded by policy, quarantine on 401/403 until fixed or operator-unlocked. Inspect live at `GET /admin/pools`; unlock with `POST /admin/pools/{name}/unlock`. See the annotated block in the example config.
+
+```yaml
+key_pools:
+  free_tier:
+    strategy: round_robin
+    keys:
+      - {ref: GROQ_KEY_1, label: groq-1, capabilities: [fast]}
+      - {ref: ks:groq2,  label: groq-2, capabilities: [fast, vision]}
+
+categories:
+  chat:
+    model: llama-3.3-70b-versatile
+    base_url: https://api.groq.com/openai/v1
+    key_pool: free_tier
+    require_capabilities: [fast]
+```
+
+### Billing plane (Stage 4)
 
 Every successful upstream completion becomes **one append-only, hash-chained cost record** in a SQLite (WAL) ledger: model, provider, key attribution (pool key ids), virtual-key attribution, token counts, integer micro-USD costs, and the exact price snapshot used. Records are linked `row_hash = SHA-256(canonical_json(record))` (or HMAC-SHA256 when `hmac_key_env` is set), so field edits, row deletions, and tail truncation are all detectable — `GET /admin/ledger/verify` recomputes the chain live, and `python -m ledger verify` does it offline. Money math is integer-only end to end: prices are stored as nano-USD per million tokens, costs accumulate as micro-USD — no floating-point drift.
 
@@ -250,14 +254,14 @@ curl "/admin/ledger/summary?group_by=model" -H "Authorization: Bearer $ADMIN"
 curl /admin/ledger/verify -H "Authorization: Bearer $ADMIN"
 ```
 
-Ledger failures never break proxying — a failed append is counted (`ledger_append_failures_total`) and logged, and the request still completes. With `ledger.enabled: false` the whole plane is inert (admin ledger endpoints answer `409 ledger_disabled`).
+Ledger failures never break proxying — a failed append is counted (`ledger_append_failures_total`) and alerted, and the request still completes. With `ledger.enabled: false` the whole plane is inert (admin ledger endpoints answer `409 ledger_disabled`).
 
-### Cost Guard (Stage 5)
+### Cost guard (Stage 5)
 
 Admission control sits **between the Stage 4 budget gate and upstream dispatch** (a spent budget still reports `402`, not `429`): sliding-window limiters first, then a token-bucket pacer. Rejected requests never reach a provider.
 
 * **Limiters** are true sliding windows in three scopes: `principal` (per virtual key; the gateway admin key is exempt, mirroring the budget gate), `pool` (per key-pool ceiling enforced at the pooled dispatch door — a blocked attempt behaves exactly like pool exhaustion, so the fallback cascade advances behind a synthetic 429), and `global` (every request, admin included). Each limiter sets exactly one dimension: `requests` or `tokens`.
-* **Estimate-to-actual reconciliation** — token windows admit a prompt estimate (`chars / estimate_chars_per_token`); when the completion's real usage lands at the ledger choke point, a signed correction swaps the estimate for the actual total, so windows hold exact usage. Pool windows keep the estimate on purpose (each upstream attempt genuinely consumed prompt tokens). Drift is reported for the R6 reconciliation audit.
+* **Estimate-to-actual reconciliation** — token windows admit a prompt estimate (`chars / estimate_chars_per_token`); when the completion's real usage lands at the ledger choke point, a signed correction swaps the estimate for the actual total, so windows hold exact usage. Pool windows keep the estimate on purpose (each upstream attempt genuinely consumed prompt tokens).
 * **Pacer** — `max_burst` immediate admits, then a steady `requests_per_second`, so bursts smooth out instead of tripping provider 429s.
 * **Billing-leak watchdog** — upstream `401`/`402` (configurable) are recorded as billing signals; the report cross-checks completions against ledger appends (`billing_visibility: ok | leaking`).
 
@@ -274,15 +278,9 @@ cost_guard:
   watchdog: {statuses: [401, 402]}
 ```
 
-A blocked request returns `429 cost_guard_rate_limited` with the full limiter verdict (limiter, scope, dimension, limit, used, retry hint). Live state — window loads per identity, admits/blocks, pacer waits, watchdog events, reconciliation counters — is one call away:
+A blocked request returns `429 cost_guard_rate_limited` with the full limiter verdict (limiter, scope, dimension, limit, used, retry hint). Live state — window loads per identity, admits/blocks, pacer waits, watchdog events, reconciliation counters — is one call away at `/admin/costguard` (auth required). Invalid `cost_guard` configuration refuses startup and hot-reload (fail-closed); an absent section disables the guard with zero behavior change.
 
-```bash
-curl /admin/costguard -H "Authorization: Bearer $ADMIN"
-```
-
-Invalid `cost_guard` configuration refuses startup and hot-reload (fail-closed); an absent section disables the guard with zero behavior change.
-
-### Operations Plane (Stage 6)
+### Operations plane (Stage 6)
 
 **Dashboard** — `GET /dashboard` (admin key, browser): status cards, active alerts, spend by model / key / day, virtual-key budgets with usage bars, a paginated ledger browser (`?page=N`, `?vk=<id>`), pool availability, circuit states, cost-guard summary and the free-tier catalog on one page. `?refresh=30..3600` adds auto-refresh, `?format=json` returns the exact snapshot the page renders. Zero external assets by design — inline CSS, no CDN, no JavaScript — so it renders in air-gapped browsers and can never leak an admin session to a third-party asset host.
 
@@ -309,18 +307,16 @@ alerts:
   webhook_url: ""              # optional http(s) target
 ```
 
-**Runbook** — day-2 operations (deploy, key rotation, pool unlock, budget changes, backup/restore, ledger-tamper incidents, alert triage, failure drills) are documented in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
-
-### Circuit Breaker
+### Circuit breaker
 
 ```yaml
 circuit_breaker:
-  failure_threshold: 3       # Consecutive 429s before tripping
-  recovery_timeout_sec: 30   # How long circuit stays open
-  window_sec: 60             # Sliding window for counting failures
+  failure_threshold: 3       # failures within the window before tripping
+  recovery_timeout_sec: 30   # how long the circuit stays open
+  window_sec: 60             # sliding window for counting failures
 ```
 
-### Routing Keywords
+### Routing keywords
 
 ```yaml
 routing:
@@ -330,32 +326,36 @@ routing:
   de_escalation_keywords:
     - thanks - thank - lol - ok - cool - nice
     - good morning - how are you - hello - hi
+  override_prefix: "/use:"
 ```
 
 ### Persona (reads both USER.md + MEMORY.md)
 
 ```yaml
 persona:
-  user_path: "~/.hermes/USER.md"      # Who the user is
-  memory_path: "~/.hermes/MEMORY.md"  # Durable facts & rules
-  max_context_chars: 800              # Max chars read for hint extraction
+  user_path: "~/.hermes/USER.md"      # who the user is
+  memory_path: "~/.hermes/MEMORY.md"  # durable facts & rules
+  max_context_chars: 800              # max chars read for hint extraction
 ```
 
-### Environment Variables
+### Environment variables
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `ROUTER_PROXY_API_KEY` | Auth for admin/metrics/circuit endpoints | none (open) |
+| `ROUTER_PROXY_API_KEY` | The gateway auth key (name is set by `auth.api_key_env`) | required, fail-closed |
 | `LOG_FORMAT` | Set to `json` for structured JSON logging | plain text |
-| `CORS_ORIGINS` | Comma-separated allowed origins | `*` |
+| `CORS_ORIGINS` | Comma-separated allow-list (off / same-origin by default; a wildcard drops credentials) | off |
 | `TRACE_LOG_DIR` | Directory for JSONL trace files | `./traces` |
 | `TRACE_LOG_MAX_BYTES` | Max bytes per trace file before rotation | `10485760` (10 MB) |
 | `TRACE_LOG_BACKUPS` | Number of rotated trace files to keep | `5` |
 | `TRACE_LOG_ENABLED` | Set to `false` or `0` to disable trace logging | `true` |
+| `ROUTER_HOST` | Override the config bind address (the Dockerfile sets `0.0.0.0`) | config value |
 
 ---
 
-## API Endpoints
+## API endpoints
+
+The complete surface (this table is parity-tested against the live route registry in both directions — `tests/test_freeze.py`):
 
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
@@ -386,63 +386,32 @@ persona:
 | `/circuits/reset` | POST | Required | Reset all circuit breakers to closed |
 | `/classifier/report` | GET | Required | Surrogate coverage, confidence distribution, routing stats, drift timeline. `?format=html` for dark-themed dashboard |
 
-The `/v1/chat/completions` endpoint accepts the standard OpenAI chat completions request body (`model`, `messages`, `temperature`, `stream`, etc.). The `model` field is overwritten by the router based on classification.
-
-### Authentication
-
-By default, the router-proxy is **open** (no auth required for `/v1/chat/completions` or `/health`). To protect admin, metrics, and circuit endpoints:
-
-```bash
-# Generate a key
-python3 -c "import secrets; print(secrets.token_urlsafe(32))"
-
-# Set it
-echo 'ROUTER_PROXY_API_KEY=your-secret-key-here' >> ~/.hermes/.env
-```
-
-Clients must send the key as a Bearer token:
-```
-Authorization: Bearer your-secret-key-here
-```
-
-If the env var is unset or empty, admin endpoints **reject all requests** (not open). The `/health` and `/v1/chat/completions` endpoints remain available.
+Authentication: send the gateway key (or a virtual key, for chat-only) as `Authorization: Bearer <token>`. Unauthenticated calls to protected surfaces get `401`; virtual keys on admin surfaces get `403 admin_only`.
 
 ---
 
-## Point Hermes At It
+## Point Hermes at it
 
-The full onboarding guide — both integration paths, model naming rules,
-virtual-key attribution, the streaming/tool-calling contract, the local
-Ollama lane and troubleshooting — lives in
-[`docs/HERMES_INTEGRATION.md`](docs/HERMES_INTEGRATION.md). The short
-form (Path A, `custom_providers`):
+The full onboarding guide — both integration paths, model naming rules, virtual-key attribution, the streaming/tool-calling contract, the local Ollama lane and troubleshooting — lives in [`docs/HERMES_INTEGRATION.md`](docs/HERMES_INTEGRATION.md). The short form (Path A, `custom_providers`):
 
 In `~/.hermes/config.yaml`:
 
 ```yaml
 model:
-  default: deepseek-v4-pro          # Primary model — router proxies to this or fallback
-  provider: auto-router             # Routes through the proxy
+  default: deepseek-v4-pro          # primary model — router proxies to this or fallback
+  provider: auto-router             # routes through the proxy
 
-# ── Custom provider block ───────────────────────────────────────────────────
 custom_providers:
 - name: auto-router
   base_url: http://localhost:8766/v1
-  model: deepseek-v4-pro            # Must match one of the configured tier models
+  model: deepseek-v4-pro            # must match one of the configured tier models
 
-# ── Fallback chain (gateway-level, fires if router-proxy is unreachable) ────
-fallback_providers:
+fallback_providers:                 # gateway-level, fires if the router itself is unreachable
 - provider: nous
   model: qwen/qwen3.6-plus
-- provider: opencode-zen
-  model: big-pickle
 ```
 
-Then restart the Hermes gateway.
-
-Want the agent's model picker to list every routable gateway model
-(with tier structure) instead of one hard-coded name? Install the
-optional model-provider plugin:
+Then restart the Hermes gateway. Want the agent's model picker to list every routable gateway model (with tier structure) instead of one hard-coded name? Install the optional model-provider plugin:
 
 ```bash
 mkdir -p ~/.hermes/plugins
@@ -451,216 +420,155 @@ echo "HERMES_ROUTER_API_KEY=vk-..." >> ~/.hermes/.env   # virtual key recommende
 hermes gateway restart
 ```
 
-See [`plugins/hermes-router-provider/README.md`](plugins/hermes-router-provider/README.md)
-for the pinned contract, configuration and verification steps.
+See [`plugins/hermes-router-provider/README.md`](plugins/hermes-router-provider/README.md) for the pinned contract, configuration and verification steps.
 
 ---
 
-## Docker Deployment
-
-The router-proxy can run as a Docker container on any host with Docker Engine.
-
-### Build & Run
+## Docker deployment
 
 ```bash
-# Build the image
 docker build -t hermes-router:latest .
 
-# Run (mount your config + env)
 docker run -d --name hermes-router --restart unless-stopped \
-  -p 8766:8766 \
+  -p 127.0.0.1:8766:8766 \
   -v /path/to/router_config.yaml:/app/router_config.yaml:ro \
-  --env-file /root/.hermes/.env \
+  --env-file /path/to/router.env \
   hermes-router:latest
 ```
 
-### Docker Compose
-
-The repo ships a hardened compose profile (`docker-compose.yaml`): loopback-only port mapping (`127.0.0.1:8766:8766` — widen explicitly if you mean to), 512 MB / 1 CPU caps with swap disabled, a stdlib `/health` healthcheck, `no-new-privileges`, all capabilities dropped, a read-only rootfs, size-capped logs, and a named `router-state` volume so the ledger, keystore and traces survive redeploys.
-
-```bash
-docker compose config    # validate (structure also pinned by tests/test_deploy.py)
-docker compose up -d
-curl -fsS localhost:8766/health
-```
-
-> **Note:** The default image comes with `router_config.example.yaml` as the config. Mount your real `router_config.yaml` to override. The env file needs the API keys and optionally `ROUTER_PROXY_API_KEY` for auth, `CORS_ORIGINS` for CORS, and `LOG_FORMAT` for JSON logging.
-
----
-
-## Classifier Performance
-
-### LLM Classifier
-
-Tested with `qwen2.5:3b` on Ollama:
-- **Accuracy:** 9/10 correct classifications
-- **Overhead:** ~200ms average per classification
-- **Misses:** Ambiguous queries ("What time is it?") — easily patched with keyword rules
-
-### TRACER Surrogate Classifier
-
-Inspired by [TRACER (Trace-Based Adaptive Cost-Efficient Routing for LLM Classification)](https://github.com/adrida/tracer) — an offline-learned surrogate model that handles the majority of classifications locally, eliminating LLM classifier calls for most requests.
-
-**How it works:**
-1. Production trace data (`classify` + `cache_hit` events) is collected continuously
-2. A weekly cron job (`refit_surrogate.sh`) refits TF-IDF and sentence-embedding classifiers against the LLM teacher labels
-3. The best candidate (by cross-validated accuracy) is saved as `.router/surrogate/pipeline.joblib`
-4. At inference time, the surrogate classifies requests with ~1ms latency and zero LLM cost
-5. A calibrated acceptor gate rejects low-confidence predictions, falling back to the LLM classifier
-
-**Current surrogate:** `embeddings_lr` (all-MiniLM-L6-v2 + LogisticRegression)
-- CV accuracy: 1.0000 (11 traces — will improve with more data)
-- Coverage: 100% of traffic handled locally
-- Teacher agreement: 100%
-
-**Key difference from TRACER:** Our router-proxy implements TRACER's trace-based adaptive routing concept but with a different architecture — we use a dual-tier (simple/complex) classifier with keyword deviation detection, session caching, and a streaming 3-tier fallback cascade with circuit breakers and key rotation. TRACER focuses on multi-class routing with a k-NN + linear probe surrogate; we use TF-IDF/embeddings + LR with teacher agreement gating.
-
-**Fitting the surrogate:**
-
-```bash
-# Default (best CV accuracy wins)
-python fit_surrogate.py
-
-# Prefer sentence embeddings when within 5% of TF-IDF accuracy
-python fit_surrogate.py --prefer-embeddings
-
-# Custom teacher agreement target
-python fit_surrogate.py --target 0.98
-```
-
-**Weekly auto-refit (cron):**
-
-A cron job runs `refit_surrogate.sh` weekly — reads traces, refits the surrogate, restarts the proxy, and runs a smoke test.
+The repo ships a hardened compose profile (`docker-compose.yaml`): loopback-only port mapping (`127.0.0.1:8766:8766` — widen explicitly if you mean to), 512 MB / 1 CPU caps with swap disabled, a stdlib `/health` healthcheck, `no-new-privileges`, all capabilities dropped, a read-only rootfs, size-capped logs, and a named `router-state` volume so the ledger, keystore and traces survive redeploys. Its structure is pinned by `tests/test_deploy.py`. The default image carries `router_config.example.yaml` — mount your real config to override; the env file needs your provider keys and the gateway key.
 
 ---
 
 ## Monitoring
 
-Start with the operations dashboard (`GET /dashboard`, admin key) and the [runbook](docs/RUNBOOK.md); the alerting heartbeat pattern (poll `/admin/status`) is documented there.
-
 ### Plain text (default)
 
 ```
-2026-05-10 13:33:00,123 [router] INFO Routing session a1b2c3 → simple (deepseek-v4-flash)
-2026-05-10 13:33:00,456 [router] INFO Deviation: escalation keyword 'debug' matched
-2026-05-10 13:33:00,789 [router] INFO Session a1b2c3 tier changed: simple → complex
-2026-05-10 13:33:01,012 [router] WARNING Primary key rate-limited (429) - switching to alternate key
+2026-10-12 09:00:01 | INFO | 127.0.0.1:52318 | POST /v1/chat/completions | 200 | 184ms | model=deepseek-v4-pro tier=code cached=False
 ```
 
 ### JSON (`LOG_FORMAT=json`)
 
-```json
-{"timestamp":"2026-05-10T13:33:00","level":"INFO","logger":"hermes-router","module":"server","line":123,"message":"Routing session a1b2c3 → simple (deepseek-v4-flash)"}
-```
+Structured logs with request id, latency, model, tier, cache state — ready for any log shipper.
 
-### Metrics (`GET /metrics`)
+### Metrics (`GET /metrics`, Prometheus text)
 
-```
-hermes_router_requests_total{tier="simple"} 15234
-hermes_router_requests_total{tier="complex"} 3892
-hermes_router_classifier_calls_total 4201
-hermes_router_classifier_latency_ms_avg 187
-hermes_router_cache_hits_total 14826
-hermes_router_429_total{tier="complex"} 3
-hermes_router_fallback_used_total{level="1"} 12
-hermes_router_fallback_used_total{level="2"} 2
-hermes_router_circuits_open 1
-hermes_router_sessions_active 8
-```
+Request and error counters per category, stream totals, pool leases and cooldowns, circuit states, cost-guard admits/blocks, ledger appends, alert firings, webhook deliveries.
 
-### Trace Logging (JSONL)
+### Trace logging (JSONL)
 
-Every routing decision is emitted as a structured JSON line to a rotating trace log. This provides a full audit trail for debugging classifier accuracy, analyzing routing patterns, and post-hoc investigation.
-
-**Configuration (environment variables):**
-
-| Variable | Purpose | Default |
-|---|---|---|
-| `TRACE_LOG_DIR` | Directory for trace files | `./traces` |
-| `TRACE_LOG_MAX_BYTES` | Max bytes per file before rotation | `10485760` (10 MB) |
-| `TRACE_LOG_BACKUPS` | Number of rotated files to keep | `5` |
-| `TRACE_LOG_ENABLED` | Set to `false` or `0` to disable | `true` |
-
-**Trace file format:**
-
-Files are named `router-trace-YYYYMMDD.jsonl` (one per day) and each line is a JSON object:
-
-```json
-{"ts":"2026-05-13T09:15:23.456Z","event":"classify","session_key":"a1b2c3","classifier_result":"complex","latency_ms":210.5,"tier":"complex","model":"deepseek-v4-pro","is_first":true}
-{"ts":"2026-05-13T09:15:24.100Z","event":"cache_hit","session_key":"a1b2c3","tier":"simple","model":"deepseek-v4-flash","age_sec":45.2}
-{"ts":"2026-05-13T09:15:25.200Z","event":"deviation","session_key":"d4e5f6","keyword":"debug","direction":"escalation","previous_tier":"simple","new_tier":"complex","model":"deepseek-v4-pro"}
-{"ts":"2026-05-13T09:15:26.300Z","event":"route","session_key":"a1b2c3","tier":"complex","model":"deepseek-v4-pro","upstream_status":200,"stream":true}
-{"ts":"2026-05-13T09:15:27.400Z","event":"circuit","base_url":"https://api.example.com/v1","old_state":"closed","new_state":"open","failures":3}
-{"ts":"2026-05-13T09:15:28.500Z","event":"key_rotation","base_url":"https://api.example.com/v1","tier":"complex","reason":"429_rate_limit"}
-{"ts":"2026-05-13T09:15:29.600Z","event":"stream_error","session_key":"a1b2c3","model":"deepseek-v4-pro","error":"RemoteProtocolError: Connection lost","failure_count":2,"max_failures":3}
-```
-
-**Event types:**
-
-| Event | When emitted | Key fields |
-|---|---|---|
-| `classify` | Flash model classifies a prompt | `session_key`, `classifier_result`, `latency_ms`, `tier`, `model`, `is_first` |
-| `cache_hit` | Reused cached tier for follow-up | `session_key`, `tier`, `model`, `age_sec` |
-| `deviation` | Keyword match changes tier mid-session | `keyword`, `direction` (escalation/de_escalation), `previous_tier`, `new_tier` |
-| `route` | Request forwarded to upstream model | `session_key`, `tier`, `model`, `upstream_status`, `stream`, `fallback_level`, `fallback_model` |
-| `circuit` | Circuit breaker state change | `base_url`, `old_state`, `new_state`, `failures` |
-| `key_rotation` | API key rotated on 429 | `base_url`, `tier`, `reason` |
-| `stream_error` | Streaming transport failure | `session_key`, `model`, `error`, `failure_count`, `max_failures` |
-
-**Querying traces:**
+Every routing decision — classification, cache hit, deviation, fallback, breaker transition — as one JSON line in `traces/`, size-capped and rotated:
 
 ```bash
-# All classification decisions for a session
-cat traces/router-trace-20260513.jsonl | jq 'select(.event=="classify")' | less
-
-# Sessions that escalated from simple to complex
-cat traces/router-trace-*.jsonl | jq 'select(.event=="deviation" and .direction=="escalation")'
-
-# Average classifier latency (ms)
-cat traces/router-trace-*.jsonl | jq 'select(.event=="classify") .latency_ms' | awk '{sum+=$1; count++} END{print sum/count}'
-
-# Circuit breaker trips
-cat traces/router-trace-*.jsonl | jq 'select(.event=="circuit" and .new_state=="open")'
+jq 'select(.event=="classification") | .tier' traces/*.jsonl | sort | uniq -c   # tier distribution
+jq 'select(.event=="fallback") | .from_model' traces/*.jsonl | sort | uniq -c  # fallback frequency
 ```
 
 ---
+
+## Testing & quality gates
+
+The release bar is the same stack CI enforces (`.github/workflows/ci.yml`):
+
+```bash
+ruff check .                 # 0 findings (E4/E7/E9/F + documented ratchets)
+mypy server.py providers.py trace.py keystore.py keypool.py catalog.py \
+      ledger.py costguard.py alerts.py dashboard.py surrogate_models.py   # 0 errors
+bandit -r . -ll              # 0 issues on the runtime surface
+pip-audit -r requirements-audit.txt        # clean, pinned closure
+pytest                       # 491 passed, 4 skipped (live-Ollama lane)
+```
+
+What the suite pins, beyond unit behavior:
+
+* **46 golden fixtures** — byte-stable transcripts of the unmodified gateway against a deterministic stub, re-captured and diffed at every stage boundary (`tests/test_golden_fixtures.py`)
+* **Load / soak** — `tests/test_load_soak.py`: 32-way concurrent streaming with exact one-ledger-row-per-request billing (this gate found and fixed a real billing-completeness bug), plus a compressed soak over the rotation/exhaustion/recovery lattice
+* **Failure drills** — `tests/test_failure_drills.py`: provider outage, key exhaustion and ledger corruption, end to end, including the backup/restore procedure
+* **Deploy contracts** — `tests/test_deploy.py`: the compose profile and systemd unit structure
+* **Freeze contracts** — `tests/test_freeze.py`: README endpoint parity (both directions), RUNBOOK coverage, RELEASE structure, version consistency — the documentation itself is tested
 
 ## Release v1.0.0 (Stage 8 freeze)
 
-The D2 v1 plan (Stages 0–8) is complete and frozen; the release
-manifest is [`docs/RELEASE.md`](docs/RELEASE.md) (gate results, the
-risk-register re-score, known limitations, and the one open owner
-decision — the root LICENSE file).
+The D2 v1 plan (Stages 0–8) is complete and frozen; the release manifest is [`docs/RELEASE.md`](docs/RELEASE.md) (gate results, the risk-register re-score, known limitations, and the resolved root LICENSE decision — MIT, dual-attribution with the upstream).
 
 Stage 8 added the hardening plane:
 
-* **Load / soak** — `tests/test_load_soak.py` pins exact billing under
-  32-way concurrent streaming (it found and closed a real
-  billing-completeness gap: streams cancelled at the final `[DONE]`
-  frame could skip their cost record), plus a deterministic compressed
-  soak over the rotation/exhaustion/recovery lattice.
-* **Failure drills** — `tests/test_failure_drills.py` drills the three
-  dossier lifecycles end-to-end: provider outage (circuit → cascade →
-  alert → half-open recovery → manual reset), key exhaustion
-  (cooldowns → synthetic 429 cascade → alert → unlock), and ledger
-  corruption + the R9 backup/restore procedure. Manual rehearsal
-  procedures: [RUNBOOK §8](docs/RUNBOOK.md).
+* **Load / soak** — `tests/test_load_soak.py` pins exact billing under 32-way concurrent streaming (it found and closed a real billing-completeness gap: streams cancelled at the final `[DONE]` frame could skip their cost record), plus a deterministic compressed soak over the rotation/exhaustion/recovery lattice.
+* **Failure drills** — `tests/test_failure_drills.py` drills the three dossier lifecycles end-to-end: provider outage (circuit → cascade → alert → half-open recovery → manual reset), key exhaustion (cooldowns → synthetic 429 cascade → alert → unlock), and ledger corruption + the R9 backup/restore procedure. Manual rehearsal procedures: [RUNBOOK §8](docs/RUNBOOK.md).
 * **24-hour soak driver** — `tools/soak.py` (stdlib-only):
 
   ```bash
-  python tools/soak.py --url http://127.0.0.1:8000 --key "$ROUTER_KEY" \
+  python tools/soak.py --url http://127.0.0.1:8766 --key "$ROUTER_PROXY_API_KEY" \
       --duration 24h --concurrency 24 --report soak_$(date +%F)
   ```
 
-All golden fixtures (46) re-verified byte-identical at freeze; the
-full gate stack (ruff / mypy / bandit / pip-audit / pytest) is green.
+All golden fixtures (46) re-verified byte-identical at freeze; the full gate stack is green. Release soak evidence: [docs/soak/README.md](docs/soak/README.md).
 
 ---
 
+## Documentation
+
+| Document | What it covers |
+|---|---|
+| [Walkthrough](docs/WALKTHROUGH.md) | zero to production, step by step (also the GitHub wiki) |
+| [Architecture](docs/ARCHITECTURE.md) | every element — purpose and function, with diagrams |
+| [Runbook](docs/RUNBOOK.md) | deploy, key rotation, backup/restore, incidents, drills, the 24h soak |
+| [Release manifest](docs/RELEASE.md) | v1.0.0 gates, stage ledger, risk re-score, known limitations |
+| [Hermes integration](docs/HERMES_INTEGRATION.md) | onboarding the agent: custom providers + plugin |
+| Stage memos | `docs/STAGE0_SOURCE_AUDIT.md` … `docs/STAGE8_HARDENING_FREEZE.md` — the engineering record |
+| Soak evidence | `docs/soak/` — reports from the release soak runs |
+
+## Project layout
+
+```
+server.py                 the gateway (FastAPI) — routing, gates, dispatch, billing, ops
+providers.py              Stage 2 provider adapters (openai / anthropic)
+keypool.py                Stage 3 key pools (rotation, cooldowns, capabilities)
+catalog.py                Stage 3 free-tier catalog (+ catalog/free_tiers.yaml)
+ledger.py                 Stage 4 immutable cost ledger + virtual keys
+costguard.py              Stage 5 admission control (limiters, pacer, watchdog)
+alerts.py                 Stage 6 alert rules + webhook
+dashboard.py              Stage 6 zero-asset dashboard
+keystore.py               Stage 1 encrypted key store (Fernet)
+trace.py                  JSONL routing-trace logging
+surrogate_models.py       classifier surrogate + vectorizer classes
+zero_shot_classifier.py   zero-shot embedding tier
+fasttext_classifier.py    fastText tier
+setfit_classifier.py      SetFit tier
+tools/soak.py             Stage 8 operator soak driver (stdlib-only)
+tools/capture_golden.py   golden fixture capture harness
+tests/                    491 tests: golden fixtures, billing, drills, load/soak, freeze contracts
+plugins/hermes-router-provider/   Stage 7 model-provider plugin
+docs/                     runbook, architecture, walkthrough, release, stage memos
+router_config.example.yaml        the fully annotated configuration template
+install.sh                the ultimate installer (install / doctor / uninstall)
+docker-compose.yaml       hardened container profile
+```
+
+## Contributing
+
+The project runs on exit gates — keep them green:
+
+1. Fork, branch, make your change (runtime changes likely ripple the golden fixtures — re-capture with `tools/capture_golden.py` and diff deliberately)
+2. Run the full gate stack (`ruff`, `mypy`, `bandit`, `pip-audit`, `pytest`) — CI runs exactly this
+3. Documentation changes are code: the freeze contracts in `tests/test_freeze.py` pin README/RUNBOOK/RELEASE structure
+4. Open a PR describing which plane your change touches and how you verified the gates
+
+## Security
+
+* Mandatory bearer auth; authless boots refuse to start (Stage 1 posture)
+* Provider keys encrypted at rest (Fernet, 0600); master key env-only; logs scrubbed
+* CORS off by default; localhost bind by default; the container exposes only what you map
+* Admin surfaces require the gateway key; virtual keys are chat-only
+* Reporting: open a private security advisory on GitHub rather than a public issue
+
 ## License
 
-MIT
+[MIT](LICENSE) — dual attribution: the upstream work by James Huang ([hermes-router-proxy](https://github.com/kjames2001/hermes-router-proxy), pinned `0a9560e`) and this hardened fork. Every file header has claimed MIT since Stage 0; the root license makes the grant explicit.
 
-## Author
+## Acknowledgements
 
-James Huang + Jarvis (Hermes Agent)
+* **James Huang + Jarvis** — the original hermes-router-proxy: the routing core, the classifier ladder idea and the transparent streaming proxy this project hardened
+* The Hermes ecosystem dossiers that shaped the stage plan — the clean-room protocol kept the billing plane free of AGPL contamination (risk R4, re-scored at release)
+
